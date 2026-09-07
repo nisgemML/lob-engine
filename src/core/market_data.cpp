@@ -30,11 +30,34 @@ int MarketDataIngestion::ingest(std::span<const uint8_t> data) noexcept {
     }
     expected_seq_.store(hdr.seq_num + 1, std::memory_order_relaxed);
 
-    auto payload = data.subspan(sizeof(WireHeader), hdr.payload_len);
-    if (payload.size() < hdr.payload_len) {
+    // Validate the declared payload length against what's ACTUALLY in
+    // `data` before constructing a subspan from it — not after. Calling
+    // std::span::subspan(offset, count) with count > size() - offset is
+    // undefined behavior per the standard: libstdc++'s implementation
+    // does not clamp or validate it, it just stores whatever count was
+    // requested as the resulting span's size. That means the check this
+    // function used to run AFTER the subspan call —
+    // `if (payload.size() < hdr.payload_len)` — was comparing
+    // hdr.payload_len against itself and could never be true: `payload`
+    // was already forced to report exactly hdr.payload_len as its size,
+    // whether or not `data` actually had that many bytes. The
+    // std::memcpy() calls in decode_new_order()/decode_cancel()/
+    // decode_modify() then read straight past the end of the real
+    // buffer. Confirmed as a genuine, exploitable heap-buffer-overflow
+    // READ under AddressSanitizer (a caller passing a byte buffer sized
+    // to exactly the bytes actually received — e.g. a UDP datagram — and
+    // a wire payload_len field larger than that): "AddressSanitizer:
+    // unknown-crash ... in memcpy", not merely a logic bug that happened
+    // to decode garbage. A malformed or truncated feed message is
+    // untrusted, adversary-influenced input for this class by design —
+    // this bound must be checked against the real buffer, not inferred
+    // from a span that was already told to lie about its own size.
+    if (data.size() < sizeof(WireHeader) + std::size_t(hdr.payload_len)) {
         stat_errors_.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
+
+    auto payload = data.subspan(sizeof(WireHeader), hdr.payload_len);
 
     MarketDataMsg msg{};
     msg.seq = hdr.seq_num;

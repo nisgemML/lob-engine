@@ -128,9 +128,18 @@ private:
 // ── Replay result ───────────────────────────────────────────────────────────
 
 struct ReplayResult {
-    uint64_t events_replayed;
-    uint64_t events_skipped;    // e.g. unknown symbol
-    uint64_t matches_generated;
+    // Default member initializers are load-bearing here, not decorative:
+    // `ReplayResult result;` at both call sites in bench_replay.cpp is a
+    // plain default-construction, and for an aggregate with no
+    // initializers, that leaves these three counters as indeterminate
+    // stack garbage until replay()'s `++result.events_replayed` etc. add
+    // 1 to whatever garbage was already there — never actually starting
+    // from zero. Confirmed directly: a run printed "Events replayed:
+    // 32400697324457" against a 500,000-event trace, which is only
+    // possible if the counter started somewhere other than zero.
+    uint64_t events_replayed  = 0;
+    uint64_t events_skipped   = 0;    // e.g. unknown symbol
+    uint64_t matches_generated = 0;
     LatencyHistogram latency;   // submit-to-first-report latency per event
 
     void print() const noexcept {

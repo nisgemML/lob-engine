@@ -265,6 +265,35 @@ When the inbound queue is empty, the loop spins with `__builtin_ia32_pause()`
 - Reduces power consumption slightly (prevents the CPU from burning all
   its power budget spinning, which could cause thermal throttling)
 
+**d) A real hazard this design missed, found while extending it: SCHED_FIFO
+without a dedicated core is actively dangerous, not just less beneficial.**
+
+`MatchingEngine::start()` used to apply `SCHED_FIFO` unconditionally,
+regardless of whether the pin to a specific core actually succeeded. That's
+fine on the intended deployment (a genuinely isolated core) — but this
+codebase's own `MultiSymbolEngine` starts N shards, each calling
+`start()`, and on any machine with fewer cores than shards (routine in CI,
+in a shared dev box, or in this project's own container-based benchmark
+runs), several of those threads end up SCHED_FIFO on the SAME core.
+
+Measured directly, not assumed: two busy-poll `SCHED_FIFO` threads at the
+same priority sharing one CPU split scheduled iterations roughly **8,800:1**
+in a 300ms window — severe, though the Linux RT-throttling safety valve
+(reserving a small default slice for non-realtime work) keeps it short of
+a full deadlock. This is exactly the failure mode you'd expect from a
+scheduling policy whose entire contract is "keep running until you block
+or a higher-priority thread preempts you," applied to more busy-poll
+threads than there are cores to run them on.
+
+`start(int cpu_id)` now couples the two: `cpu_id < 0` skips pinning **and**
+`SCHED_FIFO` together, not just pinning. A caller explicitly saying "no
+dedicated core for this thread" is also a reason not to ask for exclusive
+real-time priority over whatever core it does share — see
+`matching_engine.cpp`'s `start()` for the full reasoning, and
+`bench/bench_multisymbol.cpp` for where this was found (every shard there
+now runs unpinned deliberately, on this project's own container hardware,
+rather than fighting itself for one core).
+
 ---
 
 ## 6. The order index hash map
@@ -336,15 +365,32 @@ The round-trip from a market data update to an outbound order is therefore
 
 ## 8. Things deliberately left out
 
-**Persistence / crash recovery:** A production LOB would write-ahead-log every
-order event to a ring buffer on persistent memory (pmem) or NVMe. On restart,
-replay the log to reconstruct book state. Left out to keep the core matching
-logic clear.
+**Persistence / crash recovery:** this section used to say this was left
+out entirely — it wasn't quite true even before this update (the pieces
+already existed, just framed for a different purpose) and is actively
+misleading now. `TraceWriter`/`OrderFlowReplay` (`include/core/replay.hpp`)
+already record every order event with a timestamp and can replay them
+through a fresh `MatchingEngine` — built and used for latency
+benchmarking (`bench/bench_replay.cpp`), and proven byte-exact
+deterministic by `tools/replay_trace.cpp`'s own determinism check.
+`examples/recovery_demo.cpp` demonstrates that this is, structurally,
+exactly what a write-ahead log needs: log every event as it happens,
+destroy the engine, reconstruct a fresh one, replay the log, and the
+resulting book state matches pre-crash state exactly — verified by
+content (best bid/ask), not just "didn't crash." What's genuinely still
+absent: durability guarantees for the trace file itself (no fsync
+policy, no answer for a crash mid-write to the log), log rotation, and
+compaction — real engineering problems a production WAL has to solve
+that this demo doesn't attempt to.
 
 **Network transport:** The `MarketDataIngestion` interface accepts a raw
 `span<uint8_t>`. Plugging in DPDK, RDMA, or kernel UDP is a one-function
 change. Left out because transport is orthogonal to matching correctness and
-latency.
+latency. `examples/feed_to_execution_demo.cpp` demonstrates the missing
+piece this used to leave implicit: something has to drain
+`MarketDataIngestion`'s output queue and call `MatchingEngine::submit()`
+for each message — the two components had no code anywhere connecting
+them before that file existed, only separate test coverage for each half.
 
 **Risk / pre-trade checks:** Fat-finger limits, position limits, credit checks.
 These live between ingestion and matching. They are latency-sensitive but not
@@ -357,3 +403,51 @@ matching logic. The framework supports adding them without architectural change.
 **Cross-symbol arbitrage detection:** Detecting spread relationships across
 symbols (e.g. cash-futures basis) requires a global view across books. This
 is the job of the strategy layer, not the matching engine.
+
+---
+
+## 9. A hazard class this design creates: large fixed-size objects as stack locals
+
+This codebase's core design principle — no heap allocation on the hot
+path, so `OrderBook`, `MatchingEngine`, and `MarketDataIngestion::
+OutboundQueue` all hold their working state in fixed-size arrays directly
+as members — has a real, repeatedly-encountered downside: these objects
+are large (`sizeof(OrderBook)` ≈ 4.4MB, `sizeof(MatchingEngine)` ≈ 5.5MB,
+`sizeof(MarketDataIngestion::OutboundQueue)` ≈ 2.5MB), and the default
+Linux stack limit is 8MB. Declaring more than one of these as a plain
+local variable in one function — not behind a pointer — can silently
+approach or exceed that limit.
+
+This is not a hypothetical concern raised in the abstract: it was hit
+**three separate times** while extending this codebase, in three
+different files:
+
+1. `tests/test_order_book.cpp`'s `BookFixture` held `OrderBook` as a
+   direct member; `test_fok_atomicity` constructs three such fixtures in
+   one function. Confirmed with a real crash:
+   `AddressSanitizer: stack-overflow ... in test_fok_atomicity` (ASan's
+   stack-redzone overhead was what pushed an already-borderline case over
+   the edge — the same test passed under a plain Release build).
+2. `examples/feed_to_execution_demo.cpp`'s first version declared
+   `MatchingEngine` and `MarketDataIngestion::OutboundQueue` as plain
+   locals in `main()` — 5.5MB + 2.5MB = exactly 8.0MB before a single
+   other local variable. It segfaulted immediately, unconditionally, on
+   every run.
+3. `examples/recovery_demo.cpp` and `tools/soak_test.cpp` avoided the
+   same mistake from the start, once the pattern was recognized.
+
+**The fix, applied everywhere this was found:** heap-allocate via
+`std::make_unique<T>()` and hold a reference or pointer instead, the
+moment more than one of these types might land in the same function's
+stack frame. This is also `MatchingEngine`'s own established pattern in
+production use — its `books_` member is
+`std::array<std::unique_ptr<OrderBook>, kMaxSymbols>`, not an array of
+`OrderBook` by value — so heap-allocating these types in test/example
+code isn't a workaround, it's using the codebase the way its own
+production code already does.
+
+**If you're extending this codebase:** before declaring a local variable
+of type `OrderBook`, `MatchingEngine`, `MultiSymbolEngine<N>`, or
+`MarketDataIngestion::OutboundQueue` (or any type containing one as a
+direct member), ask whether anything else in the same function might also
+need one — if so, heap-allocate both.

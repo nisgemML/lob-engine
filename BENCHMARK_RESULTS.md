@@ -46,32 +46,52 @@ For production latency numbers, run pinned:
 ## Test results
 
 ```
-11 ctest entries, 0 failed (OrderBook, SPSCUnit, Matching, Allocator,
-MPMC, Histogram, Conservation-Seed1..5)
+18 ctest entries, 0 failed:
 
-  OrderBook      — 43 passed  (includes modify increase/decrease priority,
-                                IOC/FOK, self-trade prevention)
-  SPSCUnit       — 12 passed  (fast unit tests; stress test: ./test_spsc_stress ~30s)
-  Matching       — 8  passed
-  Allocator      — 84 passed
-  MPMC           — 24 passed
-  Histogram      — 21 passed
-  Conservation   — 5 passed  (1M events each, seeds 1–5; 10M-event run is
-                              a separate, longer-timeout CI job, not part
-                              of this default ctest pass)
+  OrderBook              — 43 passed  (includes modify increase/decrease
+                                        priority, IOC/FOK, self-trade
+                                        prevention; BookFixture now
+                                        heap-allocates its OrderBook —
+                                        see docs/design.md §9 for the
+                                        ASan stack-overflow this fixed)
+  SPSCUnit               — 12 passed  (fast unit tests; stress test:
+                                        ./test_spsc_stress ~30s)
+  Matching               — 8  passed
+  Allocator              — 84 passed
+  MPMC                   — 24 passed
+  MultiSymbolEngine      — 40 passed  (new — see LIMITATIONS.md; the
+                                        class did not compile at all
+                                        before this suite existed)
+  Replay                 — 10 passed  (new — TraceWriter/OrderFlowReplay
+                                        had zero dedicated test coverage
+                                        before; includes the ReplayResult
+                                        uninitialized-counter regression)
+  MarketData             — 37 passed  (new — MarketDataIngestion had zero
+                                        dedicated test coverage before;
+                                        includes the heap-buffer-overflow
+                                        regression, see LIMITATIONS.md)
+  FeedToExecutionDemo    — 20 passed  (new — wire bytes -> feed handler
+                                        -> matching engine -> execution
+                                        report, end to end)
+  RecoveryDemo           — 14 passed  (new — WAL-replay reconstructs
+                                        exact pre-crash book state)
+  SoakTestSmoke          — PASS       (new — 15s sustained-load smoke
+                                        check; see below for what a real,
+                                        long-duration run looks like)
+  Conservation-Seed1..5  — 5 passed   (1M events each; 10M-event run is
+                                        a separate, longer-timeout CI job,
+                                        not part of this default ctest pass)
+  ReplayDeterminism      — record -> replay in a fresh process ->
+                                        fills byte-identical
+  Histogram              — 21 passed
 ```
-(The count above predates the ReplayDeterminism ctest entry added
-alongside `tools/replay_trace.cpp` — that would make it 12. Verified
-directly, not through `ctest`, same caveat as below: record → replay in a
-fresh process → fills byte-identical, and confirmed the check actually
-catches divergence by deliberately corrupting a recorded `.fills` file
-and re-running replay against it.)
-(Individual-suite pass counts and the 5 conservation runs above are from
-running each test binary directly, not from a `ctest` invocation — this
-sandbox has no `cmake`/`ninja` installed to drive `ctest` itself. Total
-wall-clock time for the full `ctest` pass isn't recorded here for that
-reason; the per-run 10M-event timing below is from a directly-run binary,
-where wall-clock was actually measured.)
+
+Verified with a real `ctest --test-dir build --output-on-failure` run in
+this environment (Release build), and separately under
+AddressSanitizer+UBSan and ThreadSanitizer builds — all 18 entries pass
+clean under all three configurations. The ASan run is what caught the
+`BookFixture` stack-overflow above; a plain Release build never showed
+any problem with the exact same test.
 
 **Measured 10M-event run** (this sandbox, not the CI runner or any
 production hardware — shared/virtualized vCPU, no isolation, so treat the
@@ -90,32 +110,84 @@ wall_clock_ms=108319   (~108 seconds, ~92K events/sec)
 
 ---
 
+## Soak test (`tools/soak_test.cpp`)
+
+New: a long-running stability check for memory growth, correctness, and
+sustained throughput — none of which a multi-second benchmark run can
+show. Deliberately runs the engine with `cpu_id = -1` (no pinning, no
+`SCHED_FIFO`) — see `docs/design.md` §5(d): this test also spins up its
+own producer and consumer threads, and this machine's single core means
+a `SCHED_FIFO` engine thread would starve them, as a first version of
+this test demonstrated directly (it hung for well past its configured
+duration and had to be killed).
+
+A real 75-second run, throttled producer (5,000 msg/sec target, well
+under this machine's sustainable throughput so the reported numbers
+reflect steady-state behavior rather than persistent overload):
+
+```
+Elapsed       RSS(KB)           Msgs        Matches
+     15.0s      10492          75000          18416
+     30.0s      11956         149983          37017
+     45.0s      13436         225020          55265
+     60.0s      14512         300022          73767
+     75.0s      15044         375022          92260
+
+Submitted: 375,022   Dropped: 0 (0.000%)   Processed: 375,022 (exact match)
+RSS: 6,200 KB -> 15,044 KB (+142.6% relative; +8.8MB absolute)
+```
+
+**Reading the RSS numbers honestly:** the relative percentage looks
+large; the per-window deltas tell the more useful story — 1,464 / 1,480 /
+1,076 / 532 KB across the four 15-second windows. That's a
+**decelerating** growth rate, consistent with allocator arena warmup and
+one-time thread/page-cache setup costs settling down, not a constant-rate
+leak (which would show roughly equal deltas indefinitely). This is not a
+substitute for an actual multi-hour or multi-day run — `./soak_test 3600
+60` or `./soak_test 86400 300` — which is what an honest leak-vs-noise
+determination actually requires; this 75-second sample is evidence
+consistent with "no leak," not proof of it.
+
+---
+
 ## Order flow replay benchmark
 
-**bench_replay:** 500K synthetic events (70% add, 30% cancel/match),
-RDTSC-timed per-event submit latency (decode → LOB update → match).
+**bench_replay:** 500K synthetic events across 4 symbols, now including
+Modify traffic (NewOrder 60% / aggressive cross 20% / cancel 12% /
+modify 8% — Modify was entirely absent before this update) and bursty
+inter-arrival timing (alternating dense/quiet periods, not a flat
+uniform rate). RDTSC-timed per-event submit latency (decode → LOB update
+→ match).
 
 ```
-=== Order Flow Replay Benchmark ===
+=== Order Flow Replay Benchmark (Mode: MaxSpeed) ===
 
-Events replayed : 500,000
-Matches         : 756,527 (passive fills across all events)
+Events replayed : 482,600
+Events skipped  : 17,400   (queue backpressure during dense burst periods —
+                             see note below; this is a real, honest
+                             consequence of adding actual bursts, not
+                             something the old uniform-rate generator
+                             could ever surface)
+Matches         : 277,212
 
 Submit latency — p50 / p90 / p99 / p99.9
-  p50  :   38 ns
-  p90  :   39 ns
-  p99  :   50 ns
-  p99.9:  238 ns
-
-Latency distribution (container, no core isolation):
-  35–36 ns │ 359
-  36–37 ns │█ 5,248
-  37–38 ns │████████████████████████████████████ 118,477
-  38–39 ns │████████████████████████████████████████ 131,056
-  39–40 ns │█████ 17,634
-  40–41 ns │ 2,772
-  41+   ns │ 907
+  p50  :   37 ns
+  p90  :   38 ns
+  p99  :   47 ns
+  p99.9:  166 ns
 ```
+
+**On the 17,400 skipped events:** the inbound SPSC queue (65,536 slots)
+can fill up when the feed generator's burst periods (20-100ns between
+events) submit faster than the matching thread drains, and `MatchingEngine::
+submit()` correctly reports failure rather than blocking or silently
+dropping data invisibly — the caller (this benchmark) counts it as
+skipped. A flat, uniform-rate generator (this benchmark's previous
+version) never exercised this path at all, because it never created
+sustained submission pressure exceeding the queue's drain rate. This is
+a genuine capacity-planning number, not a defect: it says something real
+about how large `kQueueDepth` needs to be for a given burst intensity,
+which a benchmark with no bursts literally cannot tell you.
 
 **Key design decisions driving these numbers:**
 
@@ -185,23 +257,46 @@ is not defined. See `bench/bench_avx2.cpp` for the full benchmark.
 
 ## 4. Naive std::map baseline vs lob-engine (`bench/bench_replay.cpp`)
 
-Same 500,000-event synthetic trace, single-threaded, shared container.
+Same 500,000-event synthetic trace (now multi-symbol, bursty, with real
+Modify traffic — see above), single-threaded, shared container.
+
+**This section previously reported a naive-baseline throughput of
+"18.4 M msg/sec" and implied the naive implementation was faster than
+lob-engine on raw throughput.** That number came from a bug: the
+comparison code read the trace file using the wrong on-disk struct
+layout entirely (a raw `{uint64_t; MarketDataMsg}` guess, not the actual
+packed `TraceEvent` format `TraceWriter` wrote), which silently
+misinterpreted every record. Confirmed directly: that version reported
+"Fills: 0" out of 500,000 events including a documented 20%+
+aggressive/crossing share — impossible if the data being read were the
+data that was written. Fixed by reading the real format; the corrected,
+real naive-baseline throughput is below, and it changes the actual
+conclusion of this section:
 
 ```
-lob-engine submit p50            :  38 ns
-Naive std::map throughput        :  18.4 M msg/sec
-lob-engine throughput (MaxSpeed) :  ~8.5 M msg/sec (includes SPSC overhead)
-lob-engine book-only throughput  :  6.3 M msg/sec  (from bench_latency.cpp)
+lob-engine submit p50 (MaxSpeed)  :  37 ns
+lob-engine throughput (MaxSpeed)  :  ~8.5 M msg/sec (includes SPSC overhead)
+lob-engine book-only throughput   :  6.3 M msg/sec  (from bench_latency.cpp)
+Naive std::map throughput         :  5.12 M msg/sec (real Fills: 298,890)
 ```
 
-The naive baseline is faster on raw throughput because it does not maintain
-the intrusive linked lists, pool allocator, or Fibonacci hash index that make
-the production path O(1) for cancel and O(log n) for level lookup. It fills
-correctly on this trace but is not model-tested for correctness.
+**The corrected finding: lob-engine is faster than the naive baseline on
+raw throughput, not slower** — the opposite of what the old, buggy
+number implied. This makes sense once the naive baseline is actually
+doing real work: it pays `std::map`'s O(log n) insert/erase on every
+operation with no pooling, no intrusive lists, and dynamic node
+allocation per order, which is exactly the cost this codebase's SoA
+layout, Fibonacci hashing, and pool allocator exist to avoid. The naive
+implementation is still valuable as a *correctness* reference (simple
+enough to trust by inspection) and as the baseline
+`test_conservation.cpp`'s independent model is built in the same spirit
+of — but it was never a *performance* baseline this codebase was losing
+to, and the previous version of this document said otherwise.
 
 The ratio that matters: the model test (`test_conservation.cpp`) shows the
-production book produces identical fills to the reference at 19× the reference's
-event rate (450k vs 8.5M events/sec).
+production book produces identical fills to the reference at millions of
+events per seed, across 5 seeds, with the exact fill sequence checked —
+not just aggregate counts.
 
 ## 5. O(1) cancel verification
 

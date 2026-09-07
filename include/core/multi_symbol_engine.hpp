@@ -13,7 +13,38 @@
 //
 //   Symbols → hash → shard (one per CPU core)
 //                      ↓
-//   Each shard: one thread (pinned) + one OrderBook[] + one SPSC queue
+//   Each shard: one MatchingEngine (owns its own thread, queues, and books)
+//
+// This class does not run its own threads or own its own SPSC queues — a
+// MatchingEngine already owns exactly one of each internally. A shard is
+// just "one MatchingEngine, told which symbols route to it and which CPU
+// to pin its thread to." An earlier version of this file duplicated a
+// queue and a thread per shard on top of that (Shard::queue, Shard::thread,
+// shard_loop()) and drove them by calling shard->queue.pop(msg) and
+// shard->engine.on_message(msg) — neither of which exists on SPSCQueue or
+// MatchingEngine (the real names are try_pop() and submit()). Because this
+// is a class template and nothing anywhere in this codebase ever
+// instantiated MultiSymbolEngine and called start() on it, the compiler
+// never had a reason to fully check shard_loop()'s body — a class
+// template's member function bodies are only instantiated (and thus fully
+// type-checked) when actually called, so this went uncaught: the class
+// documented in README.md/LIMITATIONS.md as "implemented" would not
+// compile the moment anyone actually used it. Confirmed directly by
+// writing a one-file program that instantiates MultiSymbolEngine<4> and
+// calls register_symbol()/start(): two hard compile errors, exactly where
+// expected. Rewritten below to delegate everything to MatchingEngine's own
+// (already-tested) threading, queueing, and now-configurable CPU pinning
+// instead of re-implementing any of it.
+//
+// A second, subtler bug in the same file: register_symbol() placed a
+// symbol by hashing its TICKER STRING (fnv1a(symbol) & mask), but
+// submit() picked a shard by masking the message's raw integer SymbolId
+// directly (msg.symbol & mask) — two unrelated numbers. Even with the
+// method names fixed, a message would very likely be routed to a shard
+// that never registered that symbol at all. Fixed by recording the shard
+// each SymbolId was actually placed on at registration time and routing
+// by table lookup at submit time — the same decision, reused, not a
+// second computation that has to happen to agree with the first one.
 //
 // Design decisions:
 //
@@ -21,11 +52,13 @@
 //    do not have natural ordering for round-robin. FNV hash of ticker gives
 //    uniform distribution across shards.
 //
-// 2. PER-SHARD SPSC QUEUE: market data ingestion → shard queue → matching.
-//    No cross-shard communication on the matching hot path.
+// 2. NO CROSS-SHARD COMMUNICATION on the matching hot path: each shard's
+//    MatchingEngine has its own inbound/outbound SPSC queues, submitted to
+//    and drained independently.
 //
-// 3. CPU PINNING: each shard thread is pinned to a dedicated core via
-//    pthread_setaffinity_np. Reduces cache cold misses from scheduler jitter.
+// 3. CPU PINNING: each shard's MatchingEngine is started with its own
+//    cpu_id, pinning that shard's thread to a dedicated core via
+//    MatchingEngine::start()'s (now checked, not assumed) pthread_setaffinity_np.
 //
 // 4. NUMA AWARENESS (stub): for systems with multiple NUMA nodes, shards
 //    should be allocated on the same node as their CPU. Implemented as a
@@ -33,15 +66,16 @@
 //
 // ── Scaling ───────────────────────────────────────────────────────────────
 //
-// At 4 shards: 4× throughput, 4× total capacity.
-// At 16 shards (16-core machine): ~16× throughput.
+// At 4 shards: 4× throughput, 4× total capacity, assuming genuinely
+// isolated cores — see PROFILING.md §4 for what this repo could and could
+// not measure on a shared, single-core sandbox, and bench_multisymbol.cpp
+// for the real numbers this class now produces when actually exercised.
 // Cross-shard spread orders (e.g., buy C + sell P on same underlying)
 // require a coordinator — implemented as a documented stub here.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "core/matching_engine.hpp"
-#include "core/spsc_queue.hpp"
 #include "core/types.hpp"
 
 #include <array>
@@ -50,13 +84,7 @@
 #include <functional>
 #include <memory>
 #include <string_view>
-#include <thread>
 #include <vector>
-
-#if defined(__linux__)
-#  include <pthread.h>
-#  include <sched.h>
-#endif
 
 namespace engine {
 
@@ -69,9 +97,8 @@ namespace engine {
 
 // ── ShardConfig ───────────────────────────────────────────────────────────
 struct ShardConfig {
-    int         cpu_affinity  = -1;     // -1 = no pinning
-    int         numa_node     = -1;     // -1 = no NUMA preference
-    std::size_t queue_depth   = 65536;  // SPSC queue depth
+    int cpu_affinity = -1;     // -1 = no pinning (see MatchingEngine::start())
+    int numa_node    = -1;     // -1 = no NUMA preference
 };
 
 // ── MultiSymbolEngine ─────────────────────────────────────────────────────
@@ -86,15 +113,15 @@ public:
     using ExecCallback = std::function<void(ExecutionReport const&)>;
 
     // ── Shard ─────────────────────────────────────────────────────────────
+    //
+    // Just a MatchingEngine plus which CPU it should pin to and a
+    // drop counter for submissions this shard's queue couldn't accept
+    // (MatchingEngine::submit() reports success/failure per call but
+    // doesn't itself keep a running count — that bookkeeping belongs to
+    // whoever's routing to it, which is this class).
     struct Shard {
         alignas(64) MatchingEngine engine;
-        alignas(64) SPSCQueue<MarketDataMsg, 65536> queue;
-        std::thread   thread;
-        std::atomic<bool> running{false};
-        int           cpu_id{-1};
-
-        // Statistics.
-        alignas(64) std::atomic<uint64_t> msgs_processed{0};
+        int cpu_id = -1;
         alignas(64) std::atomic<uint64_t> msgs_dropped{0};
     };
 
@@ -104,6 +131,7 @@ public:
         ShardConfig const* shard_configs = nullptr)
         : on_exec_{std::move(on_exec)}
     {
+        symbol_to_shard_.fill(-1);
         for (std::size_t i = 0; i < N_SHARDS; ++i) {
             shards_[i] = std::make_unique<Shard>();
             if (shard_configs) {
@@ -116,50 +144,78 @@ public:
 
     // ── register_symbol: assign symbol to a shard ─────────────────────────
     //
-    // Must be called before start(). Thread-safe among concurrent registrations
-    // (uses the shard's own lock-free engine registration).
-    //
+    // Must be called before start(). The shard is chosen once, here, by
+    // hashing the ticker string — submit() below routes every subsequent
+    // message for this SymbolId to the SAME shard via table lookup, not by
+    // re-deriving a shard index from the message some other way.
     bool register_symbol(std::string_view symbol, SymbolId id) {
-        std::size_t shard_idx = fnv1a(symbol) & (N_SHARDS - 1);
-        return shards_[shard_idx]->engine.register_symbol(id);
+        if (id >= MatchingEngine::kMaxSymbols) return false;
+        const std::size_t shard_idx = fnv1a(symbol) & (N_SHARDS - 1);
+        if (!shards_[shard_idx]->engine.register_symbol(id)) return false;
+        symbol_to_shard_[id] = int(shard_idx);
+        return true;
     }
 
     // ── start: launch all shard threads ───────────────────────────────────
+    //
+    // Delegates to each shard's own MatchingEngine::start(cpu_id) — that
+    // is where the thread, the pinning, and the SCHED_FIFO elevation
+    // actually happen; there is no separate thread or queue at this level
+    // anymore. See is_shard_pinned()/is_shard_realtime() to check whether
+    // a given shard's pin/SCHED_FIFO request actually succeeded, per
+    // MatchingEngine's own now-checked start().
     void start() {
         for (std::size_t i = 0; i < N_SHARDS; ++i) {
-            auto* shard = shards_[i].get();
-            shard->running.store(true, std::memory_order_release);
-            shard->thread = std::thread([this, shard, i] {
-                // Pin to CPU if configured.
-                pin_to_cpu(shard->cpu_id);
-                shard_loop(shard, i);
-            });
+            shards_[i]->engine.start(shards_[i]->cpu_id);
         }
     }
 
     // ── stop: drain queues and join threads ───────────────────────────────
     void stop() {
         for (auto& shard : shards_) {
-            if (shard) shard->running.store(false, std::memory_order_release);
-        }
-        for (auto& shard : shards_) {
-            if (shard && shard->thread.joinable()) shard->thread.join();
+            if (shard) shard->engine.stop();
         }
     }
 
     // ── submit: route message to the correct shard ────────────────────────
     //
-    // Called from the feed handler / ingestion thread.
-    // Lock-free: pushes to the target shard's SPSC queue.
+    // Called from the feed handler / ingestion thread. Lock-free: pushes
+    // to the target shard's MatchingEngine's own inbound SPSC queue.
     //
-    // Returns true if successfully enqueued.
-    //
+    // Returns false if the symbol was never registered, or if the target
+    // shard's queue is full.
     [[nodiscard]] bool submit(MarketDataMsg const& msg) noexcept {
-        std::size_t shard_idx = msg.symbol & (N_SHARDS - 1);
-        auto* shard = shards_[shard_idx].get();
-        if (shard->queue.push(msg)) return true;
+        if (msg.symbol >= symbol_to_shard_.size()) return false;
+        const int shard_idx = symbol_to_shard_[msg.symbol];
+        if (shard_idx < 0) return false;  // unregistered symbol
+        auto* shard = shards_[std::size_t(shard_idx)].get();
+        if (shard->engine.submit(msg)) return true;
         shard->msgs_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+
+    // ── poll_reports: drain and dispatch execution reports from every
+    // shard ────────────────────────────────────────────────────────────────
+    //
+    // MatchingEngine itself is externally-polled (see its own
+    // poll_report()) rather than callback-driven — this class follows the
+    // same model instead of spinning one extra thread per shard just to
+    // turn polling into a callback. Call this periodically from whichever
+    // thread should observe fills (it does not need to be, and generally
+    // should not be, any shard's own matching thread). Returns the total
+    // number of reports dispatched to on_exec() across all shards in this
+    // call.
+    std::size_t poll_reports(std::size_t max_per_shard = 1024) noexcept {
+        std::size_t dispatched = 0;
+        ExecutionReport rpt;
+        for (auto& shard : shards_) {
+            for (std::size_t n = 0; n < max_per_shard; ++n) {
+                if (!shard->engine.poll_report(rpt)) break;
+                if (on_exec_) on_exec_(rpt);
+                ++dispatched;
+            }
+        }
+        return dispatched;
     }
 
     // ── Statistics ────────────────────────────────────────────────────────
@@ -168,6 +224,8 @@ public:
         uint64_t    msgs_processed;
         uint64_t    msgs_dropped;
         int         cpu_id;
+        bool        pinned;     // did this shard's pin request actually succeed?
+        bool        realtime;   // did this shard's SCHED_FIFO request actually succeed?
     };
 
     std::vector<Stats> stats() const {
@@ -176,9 +234,11 @@ public:
         for (std::size_t i = 0; i < N_SHARDS; ++i) {
             result.push_back({
                 i,
-                shards_[i]->msgs_processed.load(std::memory_order_relaxed),
+                shards_[i]->engine.messages_processed(),
                 shards_[i]->msgs_dropped.load(std::memory_order_relaxed),
                 shards_[i]->cpu_id,
+                shards_[i]->engine.is_pinned(),
+                shards_[i]->engine.is_realtime(),
             });
         }
         return result;
@@ -186,38 +246,14 @@ public:
 
     static constexpr std::size_t n_shards() noexcept { return N_SHARDS; }
 
+    // Direct access to a shard's engine — useful for tests/benchmarks that
+    // want to submit/poll a specific shard without going through the
+    // hash-based routing (e.g. to construct a worst-case single-shard load).
+    [[nodiscard]] MatchingEngine& shard_engine(std::size_t i) noexcept {
+        return shards_[i]->engine;
+    }
+
 private:
-    // ── Shard main loop ───────────────────────────────────────────────────
-    void shard_loop(Shard* shard, std::size_t shard_idx) noexcept {
-        MarketDataMsg msg;
-        while (shard->running.load(std::memory_order_acquire)) {
-            if (shard->queue.pop(msg)) {
-                shard->engine.on_message(msg);
-                shard->msgs_processed.fetch_add(1, std::memory_order_relaxed);
-            }
-            // Busy-poll: no yield, no sleep — this is the hot path.
-            // In production: add a yield after N empty polls to avoid
-            // burning CPU when idle.
-        }
-        // Drain remaining messages on shutdown.
-        while (shard->queue.pop(msg)) {
-            shard->engine.on_message(msg);
-        }
-    }
-
-    // ── CPU pinning ───────────────────────────────────────────────────────
-    static void pin_to_cpu(int cpu_id) noexcept {
-#if defined(__linux__)
-        if (cpu_id < 0) return;
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(cpu_id, &cpuset);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-#else
-        (void)cpu_id;
-#endif
-    }
-
     // ── NUMA-aware shard allocation (stub) ────────────────────────────────
     //
     // Production implementation:
@@ -229,10 +265,9 @@ private:
     // cross-NUMA memory access (~40ns extra per cache miss on dual-socket).
     //
     // Required: libnuma (apt install libnuma-dev) and build with -lnuma.
-    // See docs/numa_design.md for the full design.
-    //
 
-    std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
+    std::array<std::unique_ptr<Shard>, N_SHARDS>            shards_;
+    std::array<int, MatchingEngine::kMaxSymbols>            symbol_to_shard_{};
     ExecCallback on_exec_;
 };
 

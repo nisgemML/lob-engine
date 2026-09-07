@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <vector>
 #include <functional>
+#include <memory>
 #include <random>
 
 using namespace engine;
@@ -44,13 +45,29 @@ struct FillRecord {
 struct BookFixture {
     std::vector<FillRecord>& fills;
     std::function<void(const ExecutionReport&)> sink;
-    OrderBook book;
+    // Heap-allocated, not a direct OrderBook member: sizeof(OrderBook) is
+    // ~4.4MB (the fixed-size price-level and order-pool arrays that make
+    // the hot path allocation-free also make the object itself large).
+    // Several tests in this file (test_fok_atomicity in particular)
+    // construct multiple BookFixtures in separate scoped blocks within
+    // ONE function — as direct stack members that adds up fast, and
+    // under ASan's added stack-redzone overhead it genuinely exceeded the
+    // 8MB default stack limit: confirmed directly,
+    // "AddressSanitizer: stack-overflow ... in test_fok_atomicity" on a
+    // Release build that had not shown any problem at all (different
+    // optimization level, no redzones). Heap-allocating here matches how
+    // MatchingEngine itself already holds each OrderBook — via
+    // std::make_unique, in src/core/matching_engine.cpp — for exactly
+    // this reason; this fixture was the outlier, not OrderBook's design.
+    std::unique_ptr<OrderBook> book_ptr;
+    OrderBook& book;
     explicit BookFixture(std::vector<FillRecord>& f)
         : fills(f),
           sink([&f](const ExecutionReport& r) {
               f.push_back({ r.order_id, r.contra_order_id, r.exec_price, r.exec_qty });
           }),
-          book(0, sink) {}
+          book_ptr(std::make_unique<OrderBook>(0, sink)),
+          book(*book_ptr) {}
 };
 
 static Order make_order(OrderId id, Side side, Price price, Qty qty,

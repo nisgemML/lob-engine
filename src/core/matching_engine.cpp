@@ -26,22 +26,56 @@ bool MatchingEngine::register_symbol(SymbolId id) {
     return true;
 }
 
-void MatchingEngine::start() {
+void MatchingEngine::start(int cpu_id) {
     // release: ensures the engine_thread_ sees all state written before start().
     // The run_loop reads running_ with relaxed, relying on the SPSC acquire for
     // payload synchronisation — seq_cst is unnecessary overhead here.
     running_.store(true, std::memory_order_release);
     engine_thread_ = std::thread([this] { run_loop(); });
 
-    // Pin to CPU 1 (leave CPU 0 for OS and interrupts).
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
-    pthread_setaffinity_np(engine_thread_.native_handle(), sizeof(cpuset), &cpuset);
+    pin_cpu_id_ = cpu_id;
+    if (cpu_id >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_id, &cpuset);
+        const int rc = pthread_setaffinity_np(engine_thread_.native_handle(), sizeof(cpuset), &cpuset);
+        // pthread_* functions return the error code directly (not -1/errno) —
+        // the previous version of this function discarded this value
+        // entirely, so a pin request that silently failed (e.g. EINVAL for
+        // a cpu_id that doesn't exist on this machine) looked identical to
+        // one that succeeded to every caller and every benchmark. Nothing
+        // downstream should trust "the thread is pinned" without checking
+        // is_pinned() after this call.
+        pinned_    = (rc == 0);
+        pin_errno_ = rc;
 
-    // Elevate scheduling priority (requires CAP_SYS_NICE in production).
-    sched_param sp{ .sched_priority = 50 };
-    pthread_setschedparam(engine_thread_.native_handle(), SCHED_FIFO, &sp);
+        // SCHED_FIFO is deliberately gated on cpu_id >= 0, not applied
+        // unconditionally the way this function used to. SCHED_FIFO is a
+        // real-time policy: once running, a thread keeps the CPU until it
+        // blocks or a higher-priority real-time thread preempts it — it is
+        // NOT time-sliced against other threads at the same priority the
+        // way the default scheduler is. Verified directly: two busy-poll
+        // SCHED_FIFO threads at the same priority on one CPU produced a
+        // ~8,800:1 split of scheduled iterations in 300ms (53,084,146 vs
+        // 6,032) — not a deadlock, but severe enough that a MultiSymbolEngine
+        // started with N shards > available cores can leave most shards
+        // getting almost no CPU time at all, invisibly (each shard's
+        // engine is individually healthy; it's just never scheduled). A
+        // caller explicitly opting out of pinning (cpu_id = -1) is telling
+        // this function "no dedicated core is available for this thread" —
+        // applying SCHED_FIFO anyway in that situation is how you get the
+        // failure mode above, not how you avoid it. See
+        // docs/design.md §5 and PROFILING.md §4 for the full writeup.
+        sched_param sp{ .sched_priority = 50 };
+        const int rc2 = pthread_setschedparam(engine_thread_.native_handle(), SCHED_FIFO, &sp);
+        sched_fifo_active_ = (rc2 == 0);
+        sched_errno_        = rc2;
+    } else {
+        pinned_             = false;
+        pin_errno_          = 0;
+        sched_fifo_active_  = false;
+        sched_errno_        = 0;
+    }
 }
 
 void MatchingEngine::stop() {

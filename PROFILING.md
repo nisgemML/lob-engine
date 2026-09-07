@@ -63,54 +63,165 @@ At depth=128 this requires 32 AVX2 loads vs 128 scalar loads.
 
 ## 3. SoA vs AoS cache layout (`bench/bench_cache.cpp`)
 
+**A real, confirmed bug in this benchmark's calibration corrupted every
+absolute number it had ever reported, and — once fixed — the "SoA wins
+significantly" conclusion below turned out not to hold up on this
+hardware.** `cycles_per_ns()` used a non-`volatile` accumulator variable
+in its calibration loop; under this project's actual build flags
+(`-O3 -march=native`), the compiler proved the variable's final value was
+never observed (`(void)x` silences the unused-variable warning, it does
+not count as a use) and eliminated the entire 10-million-iteration loop
+as dead code. Confirmed by disassembly: the function's two `rdtsc()`
+calls ended up back-to-back with nothing between them. The resulting
+"calibration" measured a few nanoseconds of call/pipeline noise instead
+of 10M real iterations, producing a different, wrong GHz reading on
+every single run — five consecutive runs before the fix showed 0.08,
+0.17, 0.28, 0.29, and 0.32 GHz, on a machine whose real clock (per
+`/proc/cpuinfo`) is 2.1 GHz. Fixed by making the accumulator `volatile`,
+the same fix `bench/bench_avx2.cpp`'s own `calibrate()` already used
+correctly for the identical pattern. Post-fix, calibration reads a
+stable 2.10 GHz on every run.
+
+**The honest result once measurement is trustworthy:** at depth=1024
+(the deepest level this benchmark tests), 10 consecutive runs after the
+fix gave speedups of 1.02, 1.04, 1.03, 1.08, 1.03, 0.96, 1.02, 0.98,
+1.01, 1.05 — mean ≈1.02x, range 0.96x-1.08x. That is **not** a
+significant win; it's within the noise floor of this shared, single-core,
+virtualized sandbox, and on some runs AoS was measured as marginally
+faster. The absolute per-scan times are now trustworthy (a representative
+run):
+
 ```
 Depth    AoS (ns)   SoA (ns)   Speedup   Cache lines (AoS / SoA)
-   1       25.5       18.0      1.41x      1 / 1
-   4       55.3       50.6      1.09x      2 / 1
-  16      124.2      121.2      1.02x      8 / 2
-  64      417.5      419.8      0.99x     32 / 8
- 256     1682.8     1157.7      1.45x    128 / 32
- 512     3275.2     2486.9      1.32x    256 / 64
-1024     6368.4     4927.9      1.29x    512 / 128
+   1        2.8        2.5      1.14x      1 / 1
+   4        6.2        5.8      1.07x      2 / 1
+   8        7.8        8.0      0.98x      4 / 1
+  16        8.3        9.0      0.93x      8 / 2
+  32       14.3       15.2      0.94x     16 / 4
+  64       25.6       25.3      1.01x     32 / 8
+ 128       46.2       46.7      0.99x     64 / 16
+ 256      101.4      115.3      0.88x    128 / 32
+ 512      175.5      166.9      1.05x    256 / 64
+1024      325.7      332.0      0.98x    512 / 128
 ```
 
-SoA wins significantly at realistic book depths (16–512 levels) because the
-hot `prices[]` array fits in far fewer cache lines than an AoS layout where
-prices are interleaved with quantities and order counts.
+**What this does and doesn't mean:** the SoA layout still touches
+provably fewer cache lines (the table's own rightmost column — 128 vs 32
+at depth=1024, structurally true regardless of any timing measurement).
+Whether that translates into a *measurable* latency win depends on
+whether the working set is actually cold enough, on this specific
+hardware, for the difference to show up above other noise sources — and
+on this shared, single-core, virtualized sandbox, it largely doesn't.
+This is exactly the kind of claim that needs a quiet, dedicated,
+preferably isolated-core machine to settle with confidence (see §4 and
+`LIMITATIONS.md` for why that's not available here) — the structural
+argument for SoA (fewer cache lines touched, verified) is sound
+independent of this specific noisy measurement; the *quantitative* "1.3x
+faster" claim this section used to make was not something this
+environment, once measured correctly, actually supports.
 
 ---
 
 ## 4. Multi-symbol throughput scaling (`bench/bench_multisymbol.cpp`)
 
-```
-500,000 events/shard, unshielded OS threads (no isolcpus)
+**This section previously reported numbers from a benchmark that never
+touched `MultiSymbolEngine` at all.** The real class didn't compile
+(`SPSCQueue::pop`/`MatchingEngine::on_message` don't exist — see
+`LIMITATIONS.md` and `include/core/multi_symbol_engine.hpp`'s header
+comment for the full story), and the benchmark that produced the numbers
+below it used to show reimplemented sharding by hand with raw
+`OrderBook` objects on unpinned `std::thread`s — a different, simpler,
+never-shipped architecture. The numbers were real for THAT
+implementation; they were not evidence about the class this document,
+`README.md`, and `LIMITATIONS.md` all described as "implemented." This
+section now reports what the real, fixed `MultiSymbolEngine` actually
+does, on the same container hardware.
 
-Shards   Agg Mmsg/s   Per-shard   Scaling
-     1        8.52        8.52      1.00x
-     2        8.39        4.20      0.49x
-     4        8.89        2.22      0.26x
-     8        6.99        0.87      0.10x
+```
+CPU: Intel(R) Xeon(R) Processor @ 2.10GHz — nproc reports 1
+
+Method: MultiSymbolEngine<N>, 4 symbols hashed across N shards, one feed
+thread, 125,000 events/symbol, all shards unpinned (cpu_affinity=-1,
+which — see docs/design.md §5(d) — also means no SCHED_FIFO; forcing
+SCHED_FIFO on more busy-poll threads than this machine has cores was
+measured directly to cause severe scheduling starvation, not a speedup).
+
+Shards   Agg Mmsg/s   Scaling
+     1        4.87       1.00x
+     2        6.28       1.29x
+     4        6.66       1.37x
+     8        3.90       0.80x
 ```
 
-**Why scaling degrades on this machine:** the container has no CPU shielding.
-The OS scheduler migrates threads between physical cores mid-run, causing cache
-cold misses (the 4 MB working set must be reloaded) and TLB shootdowns.
-Each migration costs ~5–20 µs and appears as the wall-time doubling.
+**Why this looks nothing like a clean scaling curve, and why that's the
+honest answer on this hardware:** this machine has exactly one CPU core.
+There is no scenario in which N independent OS threads on one core show
+anything resembling linear scaling — what's actually being measured here
+is how well `MultiSymbolEngine`'s routing and per-shard queueing overhead
+holds up under time-sliced contention, not parallelism, because there is
+none to have. The modest improvement from 1→4 shards (up to 1.37x) is
+plausibly explained by overlap during otherwise-idle waits (one shard's
+thread can run while another is blocked on a queue-full/empty condition);
+the drop at 8 shards (0.80x, WORSE than one shard) is consistent with
+thread and context-switch overhead exceeding any such overlap benefit
+once thread count is pushed well past what one core can usefully
+interleave.
+
+**What this means for the "expected on isolated cores" claim below:**
+that projection is unchanged in spirit — genuinely independent cores
+should scale close to linearly, since each shard's `OrderBook` working
+set then stays resident in ITS OWN L2/L3, with no time-slicing
+contention at all — but this repository cannot itself validate it. There
+is no second core in this environment to pin a shard to and show the
+improvement. That's stated as a gap, not implied away.
+
+**Why scaling degrades on this machine, more precisely:** with 1 CPU,
+"the OS scheduler migrates threads between physical cores mid-run" (the
+previous version of this note's explanation) doesn't apply — there's
+only one core to run on. Time-slicing contention between shard threads,
+not cache-line migration between cores, is the mechanism here.
 
 **Expected on isolated cores:** each shard runs on its own pinned core with no
 migrations; the 4 MB working set stays in L2/L3 local to that core.
-Scaling should be ≥0.95× per doubling, i.e. 2 shards → ~1.90× aggregate.
+Scaling should be ≥0.95× per doubling, i.e. 2 shards → ~1.90× aggregate —
+not measured, see above.
 
 To reproduce on isolated hardware:
 ```bash
-# Pin N threads to N isolated cores before running:
-taskset -c 0,2,4,6 ./build/bench_multisymbol
-# Or use the MultiSymbolEngine which does pthread_setaffinity_np internally.
+# MultiSymbolEngine now supports real per-shard CPU pinning directly —
+# construct with a ShardConfig array setting cpu_affinity per shard, e.g.:
+engine::ShardConfig cfgs[4] = { {0}, {2}, {4}, {6} };  // one isolated core each
+engine::MultiSymbolEngine<4> mse(on_exec, cfgs);
 ```
 
 ---
 
-## 5. perf stat (template — paste your run here)
+## 5. perf stat — attempted, and genuinely unavailable in this environment
+
+This section used to be a template asking the reader to paste their own
+`perf stat` output. An honest update: `perf_event_open()` — the actual
+syscall behind the `perf` CLI tool, checked directly rather than assuming
+the CLI tool's own "kernel version mismatch" message was the whole
+story — returns `ENOENT` in this sandbox:
+
+```c
+struct perf_event_attr pe = { .type = PERF_TYPE_HARDWARE,
+                               .config = PERF_COUNT_HW_CPU_CYCLES, ... };
+long fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+// fd == -1, errno == ENOENT
+```
+
+This means the hardware performance-counter subsystem itself is
+unavailable here — not a missing `linux-tools-<version>` package (the
+`perf` binary IS installed; it correctly reports it can't find a
+kernel-matched helper, which is a real but different problem), and not
+fixable by installing anything in this container. Common in virtualized
+/ sandboxed environments that don't pass through PMU access to the
+guest. Getting real `IPC`/`L1-dcache-load-misses`/`branch-misses` numbers
+for this codebase requires either bare-metal Linux or a VM/container
+explicitly configured to expose the host's performance counters — the
+commands below are correct and unchanged; they simply could not be run
+to completion here.
 
 ```bash
 # Build release
@@ -124,7 +235,7 @@ taskset -c 3 chrt -f 50 \
   ./build/bench_latency
 ```
 
-Paste the `perf stat` output here. Metrics to look for:
+Metrics to look for once run on hardware that actually exposes counters:
 - IPC > 2.5 on the add_order path indicates good instruction-level parallelism
 - L1-dcache-load-misses < 1% indicates the hot path is L1-resident
 - branch-misses < 0.5% confirms the AVX2 branch elimination is working

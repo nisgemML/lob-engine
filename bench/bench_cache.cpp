@@ -11,12 +11,29 @@ static inline uint64_t rdtsc() {
     return (uint64_t)hi << 32 | lo;
 }
 
-// Estimate cycles per ns using a calibration loop
+// Estimate cycles per ns using a calibration loop.
 static double cycles_per_ns() {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t c0 = rdtsc();
-    { int x = 0; for (int i = 0; i < 10000000; ++i) x += i; (void)x; }
+    // `x` must be volatile: without it, GCC -O3 -march=native (this
+    // project's actual build flags) proves x's final value is never
+    // observed — (void)x does not count as an observation, it only
+    // silences the unused-variable warning — and eliminates this entire
+    // 10-million-iteration loop as dead code. Confirmed by disassembly:
+    // the two rdtsc() calls end up back-to-back with nothing between
+    // them, not the intended loop. The resulting "calibration" measured
+    // pipeline/syscall noise on an interval of a few nanoseconds instead
+    // of 10M real iterations, producing a different, wrong GHz reading
+    // on every single run (observed: 0.08-0.32 GHz on a machine whose
+    // real clock, per /proc/cpuinfo, is 2.1 GHz) — every absolute ns/scan
+    // figure this benchmark has ever printed was wrong by whatever
+    // random factor that run's broken calibration produced. `volatile`
+    // forces the compiler to actually perform the arithmetic on every
+    // iteration, the same fix bench_avx2.cpp's own calibrate() already
+    // used correctly for the identical pattern.
+    volatile uint64_t x = 0;
+    for (int i = 0; i < 10000000; ++i) x += uint64_t(i);
     uint64_t c1 = rdtsc();
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);

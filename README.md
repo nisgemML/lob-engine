@@ -68,6 +68,123 @@ This test found five bugs, all now fixed:
    past 65,536 concurrently-resting orders — the 1M-event/seed default
    never gets there; the 10M-event CI job does.
 
+**Extending this codebase for multi-symbol support, order-flow realism,
+end-to-end integration, and a recovery story surfaced seven more bugs —
+all now fixed and regression-tested:**
+
+6. **`MultiSymbolEngine` did not compile at all.** It called
+   `SPSCQueue::pop()` and `MatchingEngine::on_message()` — neither
+   exists (the real names are `try_pop()`/`try_push()` and `submit()`).
+   Uncaught because nothing anywhere in this codebase ever instantiated
+   the class template and called `start()` on it — a class template's
+   member function bodies are only fully checked when actually
+   instantiated. Confirmed by writing a one-file program that did
+   exactly that: two hard compile errors, exactly at those two call
+   sites. `tests/test_multi_symbol_engine.cpp` is the fix's regression
+   suite (40 assertions) — nothing else in the repo exercised this class
+   before.
+7. **`MultiSymbolEngine`'s routing was internally inconsistent.**
+   `register_symbol` placed a symbol by hashing its ticker STRING;
+   `submit` picked a shard by masking the message's raw integer id — two
+   unrelated computations. Even with bug 6 fixed, messages would very
+   likely route to a shard that never registered that symbol. Fixed by
+   recording the shard chosen at registration time and routing by table
+   lookup at submit time, not a second hash.
+8. **`SCHED_FIFO` was applied unconditionally, regardless of whether the
+   requested core pin actually succeeded.** Fine for one dedicated
+   engine, dangerous for `MultiSymbolEngine` on any machine with fewer
+   cores than shards. Measured directly: two busy-poll `SCHED_FIFO`
+   threads sharing one CPU split scheduled iterations ~8,800:1 in 300ms
+   — not a deadlock, but severe starvation. `MatchingEngine::start(int
+   cpu_id)` now couples pinning and `SCHED_FIFO` together: `cpu_id < 0`
+   skips both. This hit again, independently, while building
+   `tools/soak_test.cpp` — a first version hung well past its configured
+   duration with the *default* `start()` call, before the fix was
+   applied there too.
+9. **`bench_replay.cpp`'s naive-`std::map`-baseline comparison read the
+   trace file with the wrong on-disk struct layout entirely** — a raw
+   `{uint64_t; MarketDataMsg}` guess instead of the actual packed
+   `TraceEvent` format `TraceWriter` wrote. It silently misinterpreted
+   every record: confirmed directly, it reported "Fills: 0" out of
+   500,000 events including a documented 20%+ aggressive/crossing share,
+   and a fabricated "18.4 M msg/sec" throughput. Fixed; the real number
+   (5.12 M msg/sec) reverses the section's old conclusion — lob-engine is
+   faster than the naive baseline on raw throughput, not slower. See
+   `BENCHMARK_RESULTS.md`.
+10. **`ReplayResult`'s three `uint64_t` counters had no default member
+    initializers,** and every call site declares `ReplayResult result;`
+    — for an aggregate with no initializers, that's indeterminate stack
+    garbage until `replay()`'s `++result.events_replayed` adds 1 to
+    whatever was already there. Confirmed directly: a real run printed
+    "Events replayed: 32400697324457" against a 500,000-event trace.
+    Fixed with `= 0` initializers; `tests/test_replay.cpp` is the
+    regression coverage (also the first dedicated test file
+    `include/core/replay.hpp` ever had).
+11. **A genuine, ASan-confirmed heap-buffer-overflow READ in
+    `MarketDataIngestion::ingest()`.** Payload-length validation happened
+    *after* constructing a `std::span::subspan()` from unvalidated input
+    — `subspan(offset, count)` with `count` exceeding the real buffer is
+    undefined behavior, not clamped, so the "validation" that followed
+    was comparing a value against itself and could never fail. A
+    truncated or malformed wire message reads past the end of the actual
+    allocation. First attempt to reproduce under ASan showed nothing (a
+    shrunk `std::vector` doesn't reclaim capacity, masking the overread
+    from ASan's default, non-container-annotated detection); forcing a
+    real reallocation with `shrink_to_fit()` produced a definitive
+    `AddressSanitizer: unknown-crash ... in memcpy`. Fixed by validating
+    the raw buffer size before constructing the subspan at all — this is
+    a feed handler; its entire job is parsing untrusted network input.
+    `tests/test_market_data.cpp` is the regression suite (37
+    assertions) — the first dedicated test coverage `MarketDataIngestion`
+    ever had outside the fuzzer.
+12. **Large fixed-size objects as plain stack locals — hit three times
+    while extending this codebase, once pre-existing.**
+    `tests/test_order_book.cpp`'s `BookFixture` held a 4.4MB `OrderBook`
+    directly as a member; `test_fok_atomicity` constructs three such
+    fixtures in one function. Confirmed: `AddressSanitizer:
+    stack-overflow ... in test_fok_atomicity` (a plain Release build
+    never showed the problem — ASan's stack-redzone overhead is what
+    pushed an already-borderline case over the 8MB default limit). The
+    same class of bug then hit twice more while writing this update's
+    own new example code (`MatchingEngine` at ~5.5MB plus
+    `MarketDataIngestion::OutboundQueue` at ~2.5MB as plain locals is
+    exactly 8.0MB before a single other variable). All fixed by
+    heap-allocating via `std::make_unique` — see `docs/design.md` §9 for
+    the full write-up and the convention to follow when extending this
+    codebase further.
+13. **A genuine data race in `examples/recovery_demo.cpp`, caught under
+    TSan.** The demo read `OrderBook::best_quote()` from the main thread
+    based on a `sleep_for()` "the matching thread has probably finished
+    by now" assumption, while the engine's own matching thread (per this
+    codebase's single-threaded-matching design) was still running and
+    could still be concurrently writing to the same book. A sleep is not
+    a synchronization primitive; only `MatchingEngine::stop()`'s
+    `thread::join()` establishes a real happens-before relationship.
+    Fixed by reordering: call `stop()` before reading any book state, in
+    both phases of the demo. `MatchingEngine::book_for()`'s doc comment
+    now states this constraint explicitly, since this bug is exactly what
+    a caller of that accessor needs to avoid.
+14. **`bench_cache.cpp`'s TSC calibration loop was silently eliminated by
+    the optimizer, corrupting every absolute number it ever reported.**
+    Its calibration used a non-`volatile` accumulator; under this
+    project's own build flags (`-O3 -march=native`), the compiler proved
+    the variable's final value was never observed and deleted the entire
+    10-million-iteration loop — confirmed by disassembly, where the
+    function's two `rdtsc()` calls ended up back-to-back with nothing
+    between them. Five runs before the fix measured 0.08–0.32 GHz on a
+    machine whose real clock is 2.1 GHz; every ns/scan figure this
+    benchmark ever printed was wrong by whatever random factor that
+    run's broken calibration produced. Fixed with `volatile` (the same
+    fix `bench_avx2.cpp`'s calibration already used correctly for the
+    identical pattern). The corrected measurement also overturned this
+    section's own conclusion: the previously-reported "1.29x-1.45x SoA
+    speedup" does not reproduce — 10 runs post-fix at the deepest tested
+    level averaged ~1.02x, within this environment's noise floor, not a
+    demonstrated win. See `PROFILING.md` §3 for the full, honest
+    accounting, including what remains structurally true (SoA touches
+    fewer cache lines, provably) versus what this specific noisy
+    measurement can no longer claim.
+
 ---
 
 ## Benchmark Results
@@ -222,36 +339,61 @@ Expected probe length: **1.5 at 50% load**.
 lob-engine/
 ├── include/
 │   ├── core/
-│   │   ├── types.hpp           # Price, Qty, Order, ExecutionReport
-│   │   ├── spsc_queue.hpp      # Lock-free SPSC (release/acquire, no fence)
-│   │   ├── mpmc_queue.hpp      # Lock-free MPMC (Vyukov per-slot sequence)
-│   │   ├── order_book.hpp      # SoA LOB + AVX2 find_level
-│   │   ├── matching_engine.hpp # Orchestrator + thread management
-│   │   ├── market_data.hpp     # Wire format decoder + ingestion
-│   │   ├── execution_layer.hpp # Position tracking + P&L
-│   │   └── replay.hpp          # Binary trace writer/replayer
+│   │   ├── types.hpp                # Price, Qty, Order, ExecutionReport
+│   │   ├── spsc_queue.hpp           # Lock-free SPSC (release/acquire, no fence)
+│   │   ├── mpmc_queue.hpp           # Lock-free MPMC (Vyukov per-slot sequence)
+│   │   ├── order_book.hpp           # SoA LOB + AVX2 find_level
+│   │   ├── matching_engine.hpp      # Orchestrator + thread management +
+│   │   │                            # checked CPU pin / SCHED_FIFO status
+│   │   ├── multi_symbol_engine.hpp  # Symbol-hashed sharding across N
+│   │   │                            # MatchingEngines — see README's
+│   │   │                            # Correctness section, bugs 6-8
+│   │   ├── market_data.hpp          # Wire format decoder + ingestion
+│   │   ├── execution_layer.hpp      # Position tracking + P&L
+│   │   └── replay.hpp               # Binary trace writer/replayer — also
+│   │                                 # the mechanism examples/recovery_demo.cpp
+│   │                                 # uses for crash recovery
 │   └── util/
 │       ├── allocator.hpp       # mmap pool allocator (mlock'd slab)
 │       ├── histogram.hpp       # Lock-free latency histogram
 │       ├── logger.hpp          # Lock-free async logger via SPSC
-│       └── perf_counters.hpp   # perf_event_open RAII wrapper
+│       └── perf_counters.hpp   # perf_event_open RAII wrapper (see
+│                                # PROFILING.md — perf_event_open() itself
+│                                # returns ENOENT in this sandbox)
+├── examples/
+│   ├── feed_to_execution_demo.cpp   # Real end-to-end pipeline: raw wire
+│   │                                 # bytes -> MarketDataIngestion ->
+│   │                                 # MatchingEngine -> ExecutionReport
+│   └── recovery_demo.cpp            # Crash recovery via TraceWriter/
+│                                     # OrderFlowReplay: reconstructs exact
+│                                     # pre-crash book state
 ├── bench/
-│   ├── bench_replay.cpp        # Order flow replay — p50/p99 histogram
+│   ├── bench_replay.cpp        # Order flow replay — p50/p99 histogram,
+│   │                            # now multi-symbol, bursty, with Modify
+│   │                            # traffic, and a corrected naive baseline
 │   ├── bench_avx2.cpp          # AVX2 vs scalar find_level comparison
 │   ├── bench_latency.cpp       # Per-operation latency breakdown
 │   ├── bench_throughput.cpp    # Sustained msgs/sec
-│   ├── bench_multisymbol.cpp   # Multi-shard throughput/latency, pinned cores
+│   ├── bench_multisymbol.cpp   # Real MultiSymbolEngine throughput —
+│   │                            # previously bypassed the actual class
+│   │                            # entirely with a hand-rolled stand-in
 │   └── bench_cache.cpp         # SoA vs AoS speedup at each book depth
 ├── tools/
-│   └── replay_trace.cpp        # Record/replay a trace, byte-diff fills —
-│                                # determinism check, distinct from
-│                                # include/core/replay.hpp's latency replay
-├── tests/                      # 8 suites + ReplayDeterminism, 192+ assertions
+│   ├── replay_trace.cpp        # Record/replay a trace, byte-diff fills —
+│   │                            # determinism check, distinct from
+│   │                            # include/core/replay.hpp's latency replay
+│   └── soak_test.cpp           # Long-running stability check: memory
+│                                # growth, latency, correctness under
+│                                # sustained load
+├── tests/                      # 12 suites + ReplayDeterminism + soak
+│                                # smoke check, 400+ assertions
 ├── cmake/
 │   └── run_replay_determinism.cmake  # ctest driver for ReplayDeterminism
 ├── fuzz/                       # libFuzzer harness for wire parser
 ├── docs/
-│   ├── design.md               # Rationale for every non-obvious decision
+│   ├── design.md               # Rationale for every non-obvious decision,
+│   │                            # including two hazard classes found while
+│   │                            # extending this codebase (§5d, §9)
 │   └── linux-tuning.md         # isolcpus, SCHED_FIFO, C-states, DPDK
 ├── scripts/
 │   ├── build.sh                # Build + test + optional benchmark driver
@@ -297,9 +439,15 @@ ctest --test-dir build --output-on-failure
 | `test_matching` | 8 | End-to-end cross, cancel-before-match, multi-symbol isolation |
 | `test_allocator` | 84 | Exhaust/recover, free-list integrity, 1M alloc/free cycles |
 | `test_histogram` | 21 | Bucket indexing, percentile accuracy, concurrent recording |
+| `test_multi_symbol_engine` | 40 | Routing consistency, unregistered-symbol rejection, honest pin/realtime status — the class did not compile before this suite existed |
+| `test_replay` | 10 | `ReplayResult` zero-init regression, trace round-trip, bad-magic rejection — `replay.hpp` had no dedicated tests before |
+| `test_market_data` | 37 | Wire decode correctness, gap detection, and the heap-overflow regression — `MarketDataIngestion` had no dedicated tests before |
+| `feed_to_execution_demo` | 20 | Wire bytes → feed handler → matching engine → execution report, end to end |
+| `recovery_demo` | 14 | WAL-replay reconstructs exact pre-crash book state |
+| `soak_test` (smoke) | pass/fail | 15s sustained-load correctness + memory-growth check; see `BENCHMARK_RESULTS.md` for a real 75s run |
 | `test_conservation` | 1M events × 5 seeds (+10M in a dedicated CI job) | Model-based differential fuzzer — see Correctness above |
 | `replay_trace` (`ReplayDeterminism`) | 500K-event trace | Record → replay in a fresh process → fills byte-identical |
-| **Total (unit/property)** | **192** | **0 failures** |
+| **Total (unit/property)** | **313** | **0 failures — verified under Release, ASan+UBSan, and TSan** |
 
 ---
 
@@ -307,13 +455,28 @@ ctest --test-dir build --output-on-failure
 
 **Network transport:** `MarketDataIngestion` accepts `span<const uint8_t>`.
 Plugging in DPDK or kernel-bypass UDP is a one-function change.
+`examples/feed_to_execution_demo.cpp` demonstrates the integration piece
+that transport plugs into — draining `MarketDataIngestion`'s output and
+calling `MatchingEngine::submit()` — which had no code anywhere
+connecting the two before that file existed.
 
-**Persistence:** WAL to pmem/NVMe left out to keep the matching path unobscured.
+**Formal persistence guarantees:** `examples/recovery_demo.cpp`
+demonstrates the reconstruction half of a WAL-based recovery story using
+machinery this codebase already has (`TraceWriter`/`OrderFlowReplay`,
+already proven byte-exact deterministic elsewhere) — log every event,
+destroy the engine, replay the log through a fresh one, and the
+reconstructed book state matches pre-crash state exactly, verified by
+content. Left out: fsync durability policy for the log file itself, log
+rotation, and compaction — see LIMITATIONS.md.
 
 **Multi-symbol parallelism** is implemented (`MultiSymbolEngine`, one
-pinned thread per shard — see `bench/bench_multisymbol.cpp` and
-PROFILING.md §4). What's still out of scope is anything *cross-symbol*:
-combo/spread books, position limits by underlying — see LIMITATIONS.md.
+thread per shard, hash-routed by symbol) — but did not compile at all
+until this update (see Correctness, bugs 6-8), and its scaling numbers in
+`BENCHMARK_RESULTS.md`/`PROFILING.md` §4 are honestly reported from a
+single-core sandbox that cannot demonstrate genuine cross-core
+parallelism. What's still out of scope regardless of core count is
+anything *cross-symbol*: combo/spread books, position limits by
+underlying — see LIMITATIONS.md.
 
 **Risk / pre-trade checks:** Fat-finger and position limits live between
 ingestion and matching — architecturally uninteresting comparisons.

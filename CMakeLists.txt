@@ -97,6 +97,26 @@ target_link_libraries(bench_avx2 PRIVATE engine_core)
 add_executable(bench_multisymbol bench/bench_multisymbol.cpp)
 target_link_libraries(bench_multisymbol PRIVATE engine_core)
 
+add_executable(test_multi_symbol_engine tests/test_multi_symbol_engine.cpp)
+target_link_libraries(test_multi_symbol_engine PRIVATE engine_core)
+add_test(NAME MultiSymbolEngine COMMAND test_multi_symbol_engine)
+
+add_executable(test_replay tests/test_replay.cpp)
+target_link_libraries(test_replay PRIVATE engine_core)
+add_test(NAME Replay COMMAND test_replay)
+
+add_executable(test_market_data tests/test_market_data.cpp)
+target_link_libraries(test_market_data PRIVATE engine_core)
+add_test(NAME MarketData COMMAND test_market_data)
+
+add_executable(feed_to_execution_demo examples/feed_to_execution_demo.cpp)
+target_link_libraries(feed_to_execution_demo PRIVATE engine_core)
+add_test(NAME FeedToExecutionDemo COMMAND feed_to_execution_demo)
+
+add_executable(recovery_demo examples/recovery_demo.cpp)
+target_link_libraries(recovery_demo PRIVATE engine_core)
+add_test(NAME RecoveryDemo COMMAND recovery_demo)
+
 add_executable(test_conservation tests/test_conservation.cpp)
 target_link_libraries(test_conservation PRIVATE engine_core)
 # Multiple seeds at 1M events each in CI (see LIMITATIONS.md / README
@@ -119,6 +139,11 @@ set_tests_properties(
 
 add_executable(replay_trace tools/replay_trace.cpp)
 target_link_libraries(replay_trace PRIVATE engine_core)
+
+add_executable(soak_test tools/soak_test.cpp)
+target_link_libraries(soak_test PRIVATE engine_core)
+add_test(NAME SoakTestSmoke COMMAND soak_test 15 5)
+set_tests_properties(SoakTestSmoke PROPERTIES TIMEOUT 60)
 # Record once at configure-adjacent time isn't right for CMake, so this is
 # a ctest step: record a trace, then replay it in a second process and
 # byte-diff the fills — proves determinism (same input -> same output)
