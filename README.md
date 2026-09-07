@@ -199,9 +199,9 @@ are pending and are **not** predicted here.
 
 | Metric | Value |
 |--------|-------|
-| Submit latency p50 | **38 ns** |
-| Submit latency p99 | 50 ns |
-| Submit latency p99.9 | 238 ns |
+| Submit latency p50 | **37 ns** |
+| Submit latency p99 | 47 ns |
+| Submit latency p99.9 | 166 ns |
 <!-- BENCH:END -->
 
 p99.9 is scheduler jitter from the container. See
