@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 #include <functional>
 #include <time.h>
@@ -93,13 +94,38 @@ class TraceWriter {
 public:
     explicit TraceWriter(const char* path) {
         f_ = std::fopen(path, "wb");
-        if (!f_) return;
-
-        TraceHeader hdr{};
-        hdr.magic   = kTraceMagic;
-        hdr.version = 1;
-        std::fwrite(&hdr, sizeof(hdr), 1, f_);
+        if (!f_) {
+            // Previously silent — a caller that didn't explicitly check
+            // events_written() (bench_replay.cpp's generate_trace() did
+            // not) would proceed straight to replaying whatever was
+            // already at `path` from a PRIOR run, with zero indication
+            // anything had gone wrong. Confirmed as a real, reproducible
+            // failure mode, not a hypothetical: on WSL2, running under
+            // sudo against a trace file that already existed and was
+            // owned by a different (non-root) user, fopen(path, "wb")
+            // failed outright — root did not get the usual Unix
+            // bypass-ownership-checks behavior for truncating an
+            // existing file in this environment. The result: "Generated
+            // trace: 0 events" printed, immediately followed by a
+            // completely normal-looking 500,000-event replay — because
+            // the replay was silently reading a stale, valid trace file
+            // left over from an earlier non-sudo run, not the fresh one
+            // that (silently) failed to get written. This message and
+            // is_open() below turn that into something impossible to
+            // miss instead of something only caught by carefully
+            // reading a "0 events" line among many others.
+            std::fprintf(stderr,
+                "TraceWriter: failed to open '%s' for writing: %s\n",
+                path, std::strerror(errno));
+        } else {
+            TraceHeader hdr{};
+            hdr.magic   = kTraceMagic;
+            hdr.version = 1;
+            std::fwrite(&hdr, sizeof(hdr), 1, f_);
+        }
     }
+
+    [[nodiscard]] bool is_open() const noexcept { return f_ != nullptr; }
 
     ~TraceWriter() {
         if (f_) {

@@ -184,6 +184,25 @@ all now fixed and regression-tested:**
     accounting, including what remains structurally true (SoA touches
     fewer cache lines, provably) versus what this specific noisy
     measurement can no longer claim.
+15. **`TraceWriter` silently discarded write failures, and running on
+    real multi-core hardware for the first time found a concrete way
+    that bites.** `fopen(path, "wb")` failing left the writer object in a
+    no-op state with zero indication anything was wrong — no error
+    printed, `events_written()` simply stayed 0. Confirmed as a real,
+    reproducible failure mode, not hypothetical: on WSL2, running
+    `bench_replay` under `sudo` against a trace file that already existed
+    and was owned by a different (non-root) user, `fopen()` failed
+    outright — root did not get the usual Unix bypass-ownership-checks
+    behavior for truncating an existing file in this specific
+    environment. The result: "Generated trace: 0 events" printed,
+    immediately followed by a completely normal-looking 500,000-event
+    replay — because the replay was silently reading a stale, valid trace
+    file left over from an earlier non-`sudo` run, not the fresh one that
+    (silently) failed to get written. Fixed: `TraceWriter` now reports the
+    real `errno` reason immediately and exposes `is_open()`;
+    `bench_replay.cpp`'s `generate_trace()` hard-fails instead of
+    silently continuing; `recovery_demo.cpp` and `test_replay.cpp` both
+    got explicit `is_open()` checks. See `include/core/replay.hpp`.
 
 ---
 

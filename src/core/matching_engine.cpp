@@ -48,31 +48,40 @@ void MatchingEngine::start(int cpu_id) {
         // is_pinned() after this call.
         pinned_    = (rc == 0);
         pin_errno_ = rc;
+    } else {
+        pinned_    = false;
+        pin_errno_ = 0;
+    }
 
-        // SCHED_FIFO is deliberately gated on cpu_id >= 0, not applied
-        // unconditionally the way this function used to. SCHED_FIFO is a
-        // real-time policy: once running, a thread keeps the CPU until it
-        // blocks or a higher-priority real-time thread preempts it — it is
-        // NOT time-sliced against other threads at the same priority the
-        // way the default scheduler is. Verified directly: two busy-poll
-        // SCHED_FIFO threads at the same priority on one CPU produced a
-        // ~8,800:1 split of scheduled iterations in 300ms (53,084,146 vs
-        // 6,032) — not a deadlock, but severe enough that a MultiSymbolEngine
-        // started with N shards > available cores can leave most shards
-        // getting almost no CPU time at all, invisibly (each shard's
-        // engine is individually healthy; it's just never scheduled). A
-        // caller explicitly opting out of pinning (cpu_id = -1) is telling
-        // this function "no dedicated core is available for this thread" —
-        // applying SCHED_FIFO anyway in that situation is how you get the
-        // failure mode above, not how you avoid it. See
-        // docs/design.md §5 and PROFILING.md §4 for the full writeup.
+    // SCHED_FIFO is gated on pinned_ — whether pinning actually succeeded
+    // — not merely on whether cpu_id >= 0 was requested. An earlier
+    // version of this function gated on the request instead of the
+    // outcome, which left exactly the gap this whole check exists to
+    // close: request cpu_id=1 on a machine that only has core 0 (this
+    // project's own sandbox), and pinning fails while SCHED_FIFO still
+    // got applied — confirmed directly, bench_replay.cpp printed
+    // "pinned=no realtime=yes" on this sandbox. SCHED_FIFO is a
+    // real-time policy: once running, a thread keeps the CPU until it
+    // blocks or a higher-priority real-time thread preempts it — it is
+    // NOT time-sliced against other threads at the same priority the way
+    // the default scheduler is. Verified directly: two busy-poll
+    // SCHED_FIFO threads at the same priority on one CPU produced a
+    // ~8,800:1 split of scheduled iterations in 300ms (53,084,146 vs
+    // 6,032) — not a deadlock, but severe enough that a thread with
+    // SCHED_FIFO priority but no dedicated core can starve whatever else
+    // is sharing that core, exactly the failure mode a failed pin
+    // request should never be allowed to reach. A caller whose pin
+    // request didn't actually succeed does not have a dedicated core,
+    // regardless of what it originally asked for — applying SCHED_FIFO
+    // anyway in that situation is how you get the failure mode above,
+    // not how you avoid it. See docs/design.md §5 and PROFILING.md §4
+    // for the full writeup.
+    if (pinned_) {
         sched_param sp{ .sched_priority = 50 };
         const int rc2 = pthread_setschedparam(engine_thread_.native_handle(), SCHED_FIFO, &sp);
         sched_fifo_active_ = (rc2 == 0);
         sched_errno_        = rc2;
     } else {
-        pinned_             = false;
-        pin_errno_          = 0;
         sched_fifo_active_  = false;
         sched_errno_        = 0;
     }

@@ -48,27 +48,30 @@ public:
     //
     // cpu_id selects which core the matching thread is pinned to via
     // pthread_setaffinity_np (default 1, preserving this class's original
-    // hard-coded behavior for every existing caller). Pass -1 to skip
-    // pinning AND SCHED_FIFO both — see the "why both" note below — useful
-    // on a machine with fewer cores than a hard-coded id assumes (pinning
-    // to a nonexistent core fails with EINVAL, which the previous version
-    // of this function never checked, so the thread silently ran unpinned
-    // with no way to tell). Both the pin and the SCHED_FIFO elevation now
-    // record whether they actually took effect — see is_pinned()/
-    // is_realtime() below — instead of assuming success.
+    // hard-coded behavior for every existing caller). Pass -1 to request
+    // no pinning at all. Both the pin and the SCHED_FIFO elevation record
+    // whether they actually took effect — see is_pinned()/is_realtime()
+    // below — instead of assuming success.
     //
-    // Why cpu_id < 0 also skips SCHED_FIFO, not just pinning: SCHED_FIFO
-    // is a real-time policy — a thread keeps the CPU until it blocks or a
-    // higher-priority real-time thread preempts it, unlike the default
-    // scheduler's time-slicing. Two busy-poll SCHED_FIFO threads at the
-    // same priority sharing one CPU (measured directly, not assumed) split
-    // scheduled iterations roughly 8,800:1, not evenly — severe, though
-    // not a deadlock. Requesting SCHED_FIFO without a dedicated core is
-    // how a MultiSymbolEngine with more shards than available cores ends
-    // up with most shards individually healthy but almost never scheduled,
-    // invisibly. cpu_id = -1 means "no dedicated core for this thread,"
-    // which is also a reason not to ask for exclusive real-time priority
-    // over it. See docs/design.md §5 and PROFILING.md §4.
+    // SCHED_FIFO is gated on whether the pin actually succeeded (is_pinned()
+    // after the attempt), not merely on whether cpu_id >= 0 was requested.
+    // An earlier version of this function gated on the request instead of
+    // the outcome: on a machine with fewer cores than a hard-coded cpu_id
+    // assumes, pinning fails with EINVAL but SCHED_FIFO still got applied
+    // — confirmed directly, a benchmark run on a single-core sandbox
+    // printed "pinned=no realtime=yes". SCHED_FIFO is a real-time policy —
+    // a thread keeps the CPU until it blocks or a higher-priority
+    // real-time thread preempts it, unlike the default scheduler's
+    // time-slicing. Two busy-poll SCHED_FIFO threads at the same priority
+    // sharing one CPU (measured directly, not assumed) split scheduled
+    // iterations roughly 8,800:1, not evenly — severe, though not a
+    // deadlock. A thread with SCHED_FIFO priority but no dedicated core
+    // is exactly this failure mode waiting to happen, regardless of
+    // whether the caller explicitly passed cpu_id=-1 or asked for a core
+    // that turned out not to exist — a failed pin request means there is
+    // no dedicated core either way, and applying SCHED_FIFO anyway is how
+    // you get the failure mode above, not how you avoid it. See
+    // docs/design.md §5 and PROFILING.md §4.
     void start(int cpu_id = 1);
     void stop();
 

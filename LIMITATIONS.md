@@ -92,21 +92,31 @@ Scope is deliberate. Listed here so nobody has to discover it.
   the resting order" policies real venues also offer. Covered by
   `test_self_trade_prevention` and by the fuzzer (`test_conservation.cpp`
   assigns ~30% of generated orders one of 8 account ids).
-- **No isolated-core numbers recorded yet — and this environment cannot
-  produce them.** Everything in `BENCHMARK_RESULTS.md` is from a shared
-  container reporting exactly 1 CPU core; true core isolation
-  (`isolcpus`, a dedicated core with nothing else scheduled on it) is not
-  something a single-core machine can demonstrate regardless of
-  configuration. What WAS genuinely measurable here: `SCHED_FIFO`
-  scheduling-class behavior in isolation from core dedication —
-  and the result is a real, useful finding, not a null one. Two
-  busy-poll `SCHED_FIFO` threads sharing one core split scheduled
-  iterations roughly 8,800:1 in a direct measurement, which is exactly
-  why `MatchingEngine::start()` now refuses to apply `SCHED_FIFO` unless
-  a real core pin was also requested (`cpu_id >= 0`) — see
-  `docs/design.md` §5(d). A soak test (`tools/soak_test.cpp`) exists for
-  sustained-load correctness and memory-growth checking; it deliberately
-  runs with `cpu_id = -1` for the same reason.
+- **Isolated-core numbers: partially closed.** The original sandbox
+  (`nproc` reports 1) genuinely cannot produce them — true core isolation
+  needs at least 2 cores to exist. Real 8-core hardware (WSL2, Intel Core
+  Ultra 7 155H) has since been used to run the same benchmarks both
+  unpinned and pinned (`bench_multisymbol --pinned`, `bench_replay`'s
+  pin-status reporting) — see `PROFILING.md` §4b for the full numbers and
+  an honest, unresolved surprise in them (pinning helped at 2 and 8
+  shards, but measurably hurt at 4 shards, plausibly a hybrid P-core/
+  E-core + Hyper-V scheduling artifact, not yet confirmed). What
+  genuinely still hasn't been measured, on any hardware used so far: true
+  `isolcpus`-level isolation (a core reserved from the OS scheduler
+  entirely at boot) — WSL2 is a real Linux kernel with real parallelism,
+  but still one layer removed from that, running as a Hyper-V VM. Also
+  measured directly on the 1-core sandbox: `SCHED_FIFO` scheduling-class
+  behavior in isolation from core dedication — two busy-poll `SCHED_FIFO`
+  threads sharing one core split scheduled iterations roughly 8,800:1,
+  which is why `MatchingEngine::start()` gates `SCHED_FIFO` on whether
+  the pin actually succeeded, not merely on whether one was requested — a
+  distinction that itself came from a second real bug: a requested pin
+  that silently failed (core doesn't exist) used to still get `SCHED_FIFO`
+  applied, confirmed directly on a machine where a `cpu_id=1` request
+  failed but `SCHED_FIFO` was granted anyway. See `docs/design.md` §5(d).
+  A soak test (`tools/soak_test.cpp`) exists for sustained-load
+  correctness and memory-growth checking; it deliberately runs with
+  `cpu_id = -1` for the same reason.
 - **No hardware performance-counter data (cache-miss/branch-miss rates).**
   `perf_event_open()` fails at the syscall level in this sandbox
   (`ENOENT`) — not a missing CLI tool or a kernel-version mismatch in the

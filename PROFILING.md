@@ -171,9 +171,9 @@ interleave.
 that projection is unchanged in spirit — genuinely independent cores
 should scale close to linearly, since each shard's `OrderBook` working
 set then stays resident in ITS OWN L2/L3, with no time-slicing
-contention at all — but this repository cannot itself validate it. There
-is no second core in this environment to pin a shard to and show the
-improvement. That's stated as a gap, not implied away.
+contention at all — but this 1-core sandbox cannot itself validate it.
+Real 8-core data is now available below and tells a more interesting,
+less clean story than the simple prediction.
 
 **Why scaling degrades on this machine, more precisely:** with 1 CPU,
 "the OS scheduler migrates threads between physical cores mid-run" (the
@@ -183,15 +183,64 @@ not cache-line migration between cores, is the mechanism here.
 
 **Expected on isolated cores:** each shard runs on its own pinned core with no
 migrations; the 4 MB working set stays in L2/L3 local to that core.
-Scaling should be ≥0.95× per doubling, i.e. 2 shards → ~1.90× aggregate —
-not measured, see above.
+Scaling should be ≥0.95× per doubling, i.e. 2 shards → ~1.90× aggregate.
 
-To reproduce on isolated hardware:
+---
+
+### 4b. Real multi-core measurement (WSL2, 8 cores) — genuinely
+parallel, and genuinely more complicated than predicted
+
+`bench_multisymbol` was given a `--pinned` flag (shard *i* pinned to
+core *i* via `ShardConfig::cpu_affinity`) specifically so it could be run
+both ways on the same real hardware for a controlled comparison. Real
+run, WSL2 (Linux 6.18 kernel, Intel Core Ultra 7 155H, 8 logical cores),
+same workload as above:
+
+```
+Unpinned: 1x=9.46   2x=17.34 (1.83x)   4x=34.27 (3.62x)   8x=25.35 (2.68x)
+Pinned:   1x=10.07  2x=17.22 (1.71x)   4x=9.99  (0.99x)   8x=24.09 (2.39x)
+```
+
+**The unpinned 4-shard case (3.62x) is the closest this repo has come to
+validating genuine multi-core scaling** — real, meaningful, and roughly
+consistent with what §4's prediction would expect for a system with
+some scheduling overhead. That alone is worth having: this project's own
+architecture genuinely benefits from real parallelism when it's
+available, not just in theory.
+
+**The 4-shard PINNED case (0.99x — no better than one shard) is the
+genuinely surprising result, and it's not being explained away.** Two
+honest possibilities, neither confirmed by further measurement yet:
+
+1. This CPU (Core Ultra 7 155H) is a hybrid P-core/E-core design, and
+   WSL2 runs as a Hyper-V VM — pinning a thread to a specific *virtual*
+   core inside the guest does not pin it to a specific *physical* core;
+   the hypervisor's own scheduler still decides that mapping. It is
+   plausible that explicit pinning happened to land shards on slower
+   E-cores in this run, while the OS's own free scheduling (the unpinned
+   case) opportunistically found faster P-cores — meaning pinning could
+   genuinely backfire in a virtualized, hybrid-core environment in a way
+   it would not on genuinely uniform bare-metal cores.
+2. Simple run-to-run variance on a machine also running a full desktop
+   OS underneath the VM — this was a single run each way, not an
+   averaged series.
+
+**This is exactly why "pinned" and "isolated" are not the same claim,
+stated plainly rather than glossed over.** `ShardConfig::cpu_affinity`
+gives you process-level affinity — a request the OS (and, here, the
+hypervisor) is free to honor imperfectly. True `isolcpus`-level isolation
+(a core reserved from the scheduler entirely, at boot, with nothing else
+— not even the kernel's own housekeeping — touching it) is a stronger,
+different guarantee this repo still has not measured, on bare metal or
+otherwise. The right conclusion from this specific dataset is "pinning
+is not free lunch in a virtualized, hybrid-core environment," not
+"pinning doesn't work" — the 2-shard and 8-shard cases both still show
+substantial real speedup over one shard either way.
+
+To reproduce on your own hardware:
 ```bash
-# MultiSymbolEngine now supports real per-shard CPU pinning directly —
-# construct with a ShardConfig array setting cpu_affinity per shard, e.g.:
-engine::ShardConfig cfgs[4] = { {0}, {2}, {4}, {6} };  // one isolated core each
-engine::MultiSymbolEngine<4> mse(on_exec, cfgs);
+./bench_multisymbol            # unpinned baseline
+./bench_multisymbol --pinned   # shard i -> core i
 ```
 
 ---

@@ -109,7 +109,8 @@ int main() {
 
     {
         TraceWriter wal(wal_path);
-
+        CHECK(wal.is_open(), "WAL file opened successfully — see stderr above if not "
+                              "(TraceWriter now reports the errno directly on open failure)");
         CHECK(submit_and_log(*engine1, wal, new_order(1, Side::Sell, 101.00, 200)), "resting sell 1 logged+submitted");
         CHECK(submit_and_log(*engine1, wal, new_order(2, Side::Sell, 101.50, 300)), "resting sell 2 logged+submitted");
         CHECK(submit_and_log(*engine1, wal, new_order(3, Side::Buy,   99.50, 150)), "resting buy 1 logged+submitted");

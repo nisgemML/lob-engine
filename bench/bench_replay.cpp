@@ -82,6 +82,19 @@ struct NaiveBook {
 // hit) rather than a steady drip.
 static void generate_trace(const char* path, int n_events, int n_symbols) {
     TraceWriter writer(path);
+    if (!writer.is_open()) {
+        // Hard-fail rather than proceed — this function used to have no
+        // check here at all, meaning a failed TraceWriter open silently
+        // left whatever trace file already existed at `path` untouched,
+        // and every caller downstream (the replay that follows) would
+        // run against that stale data with zero indication the "fresh"
+        // trace generation this call claims to have just done never
+        // actually happened. TraceWriter itself now reports the errno
+        // directly; this exits so nothing downstream can mistake old
+        // data for new.
+        std::fprintf(stderr, "generate_trace: aborting, could not open '%s'\n", path);
+        std::exit(1);
+    }
     std::mt19937_64 rng(0xDEADBEEF);
 
     // Simulated clock starting at "9:30 AM"
@@ -193,6 +206,18 @@ int main(int argc, char** argv) {
     engine.register_symbol(0);
     for (int s = 1; s < n_symbols; ++s) engine.register_symbol(SymbolId(s));
     engine.start();
+    // Surfaced, not assumed: whether the pin/SCHED_FIFO request this
+    // engine made at start() actually succeeded depends on the host
+    // (this project's own sandbox has 1 CPU, where pinning to core 1
+    // always fails) — printing it means a benchmark run on real
+    // hardware can be trusted rather than hoped about.
+    printf("Engine thread : cpu=%d pinned=%s realtime=%s\n",
+           engine.pin_cpu_id(), engine.is_pinned() ? "yes" : "no",
+           engine.is_realtime() ? "yes" : "no");
+    if (!engine.is_pinned())
+        printf("  pin failed: %s\n", strerror(engine.pin_errno()));
+    if (!engine.is_realtime())
+        printf("  SCHED_FIFO failed: %s (needs CAP_SYS_NICE or root)\n", strerror(engine.sched_errno()));
 
     // ── Replay at max speed ──────────────────────────────────────────────────
     printf("\n[Mode: MaxSpeed]\n");

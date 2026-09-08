@@ -59,6 +59,7 @@ static void test_trace_write_and_replay_round_trip() {
 
     {
         TraceWriter writer(path);
+        CHECK(writer.is_open(), "WAL file opened successfully");
         for (uint64_t i = 0; i < kEvents; ++i) {
             MarketDataMsg msg{};
             msg.msg_type   = MarketDataMsg::Type::NewOrder;

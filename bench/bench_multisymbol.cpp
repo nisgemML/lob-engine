@@ -86,11 +86,27 @@ static std::vector<MarketDataMsg> gen_events(uint64_t seed, size_t n, SymbolId s
 }
 
 template <std::size_t N_SHARDS>
-static double run_with_n_symbols(std::size_t n_symbols, std::size_t events_per_symbol) {
+static double run_with_n_symbols(std::size_t n_symbols, std::size_t events_per_symbol, bool pinned) {
     std::atomic<uint64_t> fills{0};
-    MultiSymbolEngine<N_SHARDS> mse([&](const ExecutionReport&) {
-        fills.fetch_add(1, std::memory_order_relaxed);
-    });
+
+    // Real per-shard CPU pinning, added for anyone running this on
+    // genuine multi-core hardware (this project's own sandbox has 1 CPU,
+    // where pinning is actively harmful — see this file's header comment
+    // and docs/design.md §5(d)). ShardConfig::cpu_affinity = -1 (default,
+    // used when pinned=false) skips both pinning and SCHED_FIFO, exactly
+    // as before. When pinned=true, shard i is pinned to core i directly
+    // — simple, not the full isolcpus-isolated-core story (that needs
+    // kernel boot parameters reserving the core from the OS scheduler
+    // entirely, not just this process's own affinity request), but a
+    // real, honest step up from "everything on 1 shared core," and
+    // directly comparable against the unpinned run on the SAME machine.
+    std::vector<ShardConfig> cfgs(N_SHARDS);
+    if (pinned) {
+        for (std::size_t i = 0; i < N_SHARDS; ++i) cfgs[i].cpu_affinity = int(i);
+    }
+    MultiSymbolEngine<N_SHARDS> mse(
+        [&](const ExecutionReport&) { fills.fetch_add(1, std::memory_order_relaxed); },
+        pinned ? cfgs.data() : nullptr);
 
     for (SymbolId s = 0; s < n_symbols; ++s) {
         char name[16];
@@ -136,15 +152,16 @@ static double run_with_n_symbols(std::size_t n_symbols, std::size_t events_per_s
     return double(total_submitted) / secs;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool pinned = (argc > 1) && (std::string(argv[1]) == "--pinned");
     constexpr std::size_t kEventsPerSymbol = 500'000 / 4; // keep total events comparable across shard counts
 
     printf("CPU        : %s\nCompiler   : GCC %d.%d.%d\n\n",
         env_line("/proc/cpuinfo", "model name").c_str(),
         __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
     printf("Method: MultiSymbolEngine<N>, N symbols hashed across N shards,\n");
-    printf("        one feed thread, %zu events/symbol, unpinned (see header).\n\n",
-           kEventsPerSymbol);
+    printf("        one feed thread, %zu events/symbol, %s.\n\n",
+           kEventsPerSymbol, pinned ? "shard i pinned to core i" : "unpinned (see header)");
 
     printf("%-10s %14s %12s\n", "Shards", "Agg Mmsg/s", "Scaling");
     printf("%-10s %14s %12s\n", "------", "----------", "-------");
@@ -152,27 +169,34 @@ int main() {
     double baseline = 0.0;
 
     {
-        double r = run_with_n_symbols<1>(4, kEventsPerSymbol);
+        double r = run_with_n_symbols<1>(4, kEventsPerSymbol, pinned);
         baseline = r;
         printf("%-10d %13.2f %11.2fx\n", 1, r / 1e6, 1.0);
     }
     {
-        double r = run_with_n_symbols<2>(4, kEventsPerSymbol);
+        double r = run_with_n_symbols<2>(4, kEventsPerSymbol, pinned);
         printf("%-10d %13.2f %11.2fx\n", 2, r / 1e6, r / baseline);
     }
     {
-        double r = run_with_n_symbols<4>(4, kEventsPerSymbol);
+        double r = run_with_n_symbols<4>(4, kEventsPerSymbol, pinned);
         printf("%-10d %13.2f %11.2fx\n", 4, r / 1e6, r / baseline);
     }
     {
-        double r = run_with_n_symbols<8>(4, kEventsPerSymbol);
+        double r = run_with_n_symbols<8>(4, kEventsPerSymbol, pinned);
         printf("%-10d %13.2f %11.2fx\n", 8, r / 1e6, r / baseline);
     }
 
-    printf("\nNote: all shards run with cpu_affinity=-1 (unpinned, no SCHED_FIFO) —\n");
-    printf("see this file's header comment for why forcing pinning/SCHED_FIFO on\n");
-    printf("a machine with fewer cores than shards would make these numbers WORSE\n");
-    printf("and misleading, not better. This measures MultiSymbolEngine's routing\n");
-    printf("and threading overhead in isolation from core-count effects, not the\n");
-    printf("scaling a genuinely multi-core, isolated-core deployment would show.\n");
+    if (pinned) {
+        printf("\nNote: shard i pinned to core i via ShardConfig::cpu_affinity — a real\n");
+        printf("step up from 1-core sandbox numbers, but not the full isolcpus story:\n");
+        printf("this is process-level affinity, not a core reserved from the OS\n");
+        printf("scheduler at boot. Run with no arguments (unpinned) on the SAME\n");
+        printf("machine for a direct, controlled comparison.\n");
+    } else {
+        printf("\nNote: all shards run with cpu_affinity=-1 (unpinned, no SCHED_FIFO) —\n");
+        printf("see this file's header comment for why forcing pinning/SCHED_FIFO on\n");
+        printf("a machine with fewer cores than shards would make these numbers WORSE\n");
+        printf("and misleading, not better. Run with --pinned on real multi-core\n");
+        printf("hardware for genuine per-shard core pinning.\n");
+    }
 }

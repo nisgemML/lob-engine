@@ -285,14 +285,31 @@ scheduling policy whose entire contract is "keep running until you block
 or a higher-priority thread preempts you," applied to more busy-poll
 threads than there are cores to run them on.
 
-`start(int cpu_id)` now couples the two: `cpu_id < 0` skips pinning **and**
-`SCHED_FIFO` together, not just pinning. A caller explicitly saying "no
-dedicated core for this thread" is also a reason not to ask for exclusive
-real-time priority over whatever core it does share — see
-`matching_engine.cpp`'s `start()` for the full reasoning, and
-`bench/bench_multisymbol.cpp` for where this was found (every shard there
-now runs unpinned deliberately, on this project's own container hardware,
-rather than fighting itself for one core).
+**First fix (superseded):** `start(int cpu_id)` initially coupled the two
+by *request* — `cpu_id < 0` skipped pinning **and** `SCHED_FIFO` together.
+That closed the case above, but left a different, related gap: a caller
+that *did* pass `cpu_id >= 0`, on a machine where that specific core
+doesn't exist, would have its pin attempt fail (`pthread_setaffinity_np`
+returning `EINVAL`) while `SCHED_FIFO` still got applied anyway — because
+the gate checked what was *asked for*, not what actually happened.
+Confirmed directly, not hypothetically: `bench_replay` on a 1-core
+sandbox, requesting `cpu_id=1` (a core that doesn't exist there), printed
+`pinned=no realtime=yes` — the exact hazard this section exists to guard
+against, reached through a path the first fix didn't cover.
+
+**Current fix:** `SCHED_FIFO` is now gated on whether the pin *actually
+succeeded* (`is_pinned()` after the `pthread_setaffinity_np` call), not on
+what `cpu_id` was requested. A caller whose pin attempt failed — whether
+because it explicitly passed `cpu_id = -1`, or because it asked for a real
+core number that turned out not to exist on this machine — has no
+dedicated core either way, and gets no `SCHED_FIFO` elevation either way.
+Verified this closes the gap: the same `bench_replay` run above now
+correctly reports `pinned=no realtime=no`. See `matching_engine.cpp`'s
+`start()` for the full reasoning, and `bench/bench_multisymbol.cpp` for
+where the original hazard was found (every shard there ran unpinned by
+default on this project's own single-core sandbox, with a `--pinned` flag
+added once real multi-core hardware was available to test the intended
+case for real).
 
 ---
 
