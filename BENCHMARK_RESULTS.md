@@ -238,10 +238,10 @@ AVX2 SIMD: compares 4 × `int64_t` per cycle (`VPCMPEQQ ymm, ymm, ymm`).
 
 ```
 Method        p50(ns)  p90(ns)  p99(ns)  p99.9(ns)
-Scalar            71       91      149        296
-AVX2              35       42       61        185
+Scalar            67       90      115        174
+AVX2              42       53       64        130
 
-Speedup at p50: 2.0×
+Speedup at p50: 1.6×
 Correctness: PASS (0 errors — verified against scalar on 5M random targets)
 ```
 

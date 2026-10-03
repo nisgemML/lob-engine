@@ -227,12 +227,17 @@ p99.9 is scheduler jitter from the container. See
 [docs/linux-tuning.md](docs/linux-tuning.md) for the isolated-core setup;
 the table will be replaced by an isolated run when one is recorded.
 
+Note: this is `bench_replay.cpp`'s full order-flow-replay submit path, not
+the same measurement as `PROFILING.md`'s isolated SPSC-only push benchmark
+(32ns, from `bench_latency.cpp`) — different code paths, both real, not
+directly comparable. See `PROFILING.md` §1 for that distinction spelled out.
+
 ### AVX2 vs scalar `find_level` — N=128 price levels, 5M iterations
 
 | Method | p50 | p90 | p99 | Speedup |
 |--------|-----|-----|-----|---------|
-| Scalar | 71 ns | 91 ns | 149 ns | 1× |
-| AVX2 (`VPCMPEQQ`) | **35 ns** | 42 ns | 61 ns | **2.0×** |
+| Scalar | 67 ns | 90 ns | 115 ns | 1× |
+| AVX2 (`VPCMPEQQ`) | **42 ns** | 53 ns | 64 ns | **1.6×** |
 
 AVX2 processes 4× int64 per cycle vs scalar 1×. See `bench/bench_avx2.cpp`.
 
@@ -240,7 +245,7 @@ AVX2 processes 4× int64 per cycle vs scalar 1×. See `bench/bench_avx2.cpp`.
 
 | Component | Cost |
 |-----------|------|
-| `find_level()` AVX2 | 35 ns |
+| `find_level()` AVX2 | 42 ns |
 | Intrusive list walk (cancel) | 22 ns |
 | Pool allocator | 3–5 ns |
 | SPSC enqueue | 12 ns |
@@ -296,7 +301,7 @@ for (uint32_t i = 0; i < n; i += 4) {
 }
 ```
 
-Measured speedup: **2.0× at p50** (35 ns vs 71 ns, N=128 levels).
+Measured speedup: **1.6× at p50** (42 ns vs 67 ns, N=128 levels).
 Branch mispredictions also drop 4× — AVX2 has 32 iterations vs 128 scalar.
 
 ### Cache-aware order book — struct-of-arrays

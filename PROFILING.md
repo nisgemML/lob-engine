@@ -30,6 +30,15 @@ submit via SPSC                p50=  32 ns   p99=     49 ns   p99.9= 11,398 ns
 Throughput: 6.3 M msg/sec  (1M orders, single thread)
 ```
 
+**Not the same measurement as README's "Submit latency" (37ns):** that
+number comes from `bench_replay.cpp`'s fuller order-flow-replay path
+(decode + book update + submit, replayed from a 500K-event synthetic
+trace); this 32ns is `bench_latency.cpp`'s isolated SPSC-only push cost in
+section 2 below. Both are real and both reproduce on re-run — they're
+just not the same code path, and citing one as if it were the other (an
+earlier mistake caught while reconciling this repo's numbers) produces a
+false "discrepancy" that isn't actually there.
+
 The p99 spikes on add/cancel are L2/LLC misses from the cold order-index hash
 lookup when the working set (65,536-slot pool × 64 bytes = 4 MB) exceeds L2.
 On an isolated core with a warm working set the p99 converges to 2–3× p50.
