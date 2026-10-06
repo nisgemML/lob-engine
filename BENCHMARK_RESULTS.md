@@ -257,8 +257,14 @@ Container (one vCPU, no isolation), so treat the absolute ns as tier-2. The
 shape is the result.
 
 Why nothing caught it earlier: the conservation test and all benchmarks run
-shallow books, and tick-to-trade's real Nasdaq BX day has 15-60 resting
-orders per symbol. A main-venue day would have hit it.
+shallow books with consecutive ids. Whether real exchange data would have
+hit it was not measured. In a real ITCH feed, order refs are assigned across
+all symbols, so one book's refs are spaced out by other symbols' orders, and
+the old hash's clustering depends on that spacing. (tick-to-trade later
+replayed a NASDAQ main-venue day through the *fixed* engine: AAPL, MSFT and
+TSLA books of ~3,700-5,100 price levels matched an independent reference at
+12 cut points. That validates the fixed engine at real depth. It says
+nothing about how the old hash would have behaved.)
 
 **Removed:** a previous "Per-operation latency (unit test instrumentation)"
 section (`add_order p50 = 112 ns`, `mean probe length: 1.48`). No code in

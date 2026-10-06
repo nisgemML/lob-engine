@@ -10,8 +10,12 @@ prefaults itself; `bench_depth` counts 0 faults while matching).
 - **Correctness:** fill-by-fill equality with an independent reference model
   on 5 × 1M random events in CI, under ASan, UBSan and TSan.
 - **Real data:** [tick-to-trade](https://github.com/nisgemML/tick-to-trade)
-  replays a real Nasdaq BX day through this engine. At 8 cut points, every
-  price level of the engine's book equals an independent reference book.
+  replays real NASDAQ days through this engine. On the main venue
+  (2020-01-30, 423M messages), AAPL, MSFT and TSLA books of ~3,700-5,100
+  price levels equal an independent reference at all 12 cut points (52,745
+  levels compared). The same holds for a Nasdaq BX day. Replays produce no
+  fills, so this validates book maintenance; matching is covered by the
+  conservation test.
 - **Deep books (bug #16):** the order index's hash collapsed under
   sequential order ids. One cancel took 3.5 ms with 8,000 live orders. Now
   cancel is ~55 ns, flat to 60,000 live orders, and a structural test pins it.
