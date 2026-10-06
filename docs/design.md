@@ -192,36 +192,56 @@ side.tail_idxs[lvl_idx]               = slot;
 
 ## 4. The pool allocator
 
+**Scope first:** `util::PoolAllocator` is a standalone utility with its own
+tests. The matching engine does **not** use it. `OrderBook` keeps orders in
+fixed in-object arrays (`SlotPool`) and prefaults every page of them at
+construction (see "Page faults" below). Earlier versions of this document and
+the README described the allocator's mmap/mlock design as the engine's memory
+strategy, which it never was.
+
 ### Why not `malloc`?
 
-`malloc` in glibc uses a thread-local arena + a global fallback. Even the
-happy path (local arena, no contention) involves:
-- Checking the freelist for the right size class
-- Updating the freelist pointers
-- Potentially zeroing memory
-- A store fence to ensure visibility
-
-This is ~50–100 ns for a small allocation and non-deterministic in the worst
-case (fragmented heap, arena lock contention).
+Even glibc's fast path (thread-local cache, no contention) walks size-class
+freelists, and the slow path can take an arena lock or call `mmap`/`brk`.
+The concern is not the typical cost but the unbounded tail. (No `malloc`
+latency is measured in this repo.)
 
 ### The slab design
 
 ```
-[mmap'd page] [Order][Order][Order]...[Order]
-               ↑                            ↑
-               slab_                        slab_ + N*sizeof(Order)
+[mmap'd region] [Order][Order][Order]...[Order]
+                 ↑                            ↑
+                 slab_                        slab_ + N*sizeof(Order)
 ```
 
-The free list is threaded through the slab itself — each free slot's first
-bytes hold a pointer to the next free slot. No external metadata.
+The free list is threaded through the slab itself: each free slot's first
+bytes hold the next free slot. Allocation and free are each three memory
+operations (load `free_head`, follow one pointer, store), with no locks and
+no syscalls.
 
-`mlock` pins the pages. After startup, every allocation and deallocation is:
-1. Load `free_head`
-2. Follow one pointer
-3. Store new `free_head`
+**Setup order matters, and used to be wrong.** The slab is `mmap`ed, then
+`madvise(MADV_HUGEPAGE)`, then `mlock`ed, which faults it in and pins it. The
+old code mapped with `MAP_POPULATE` and advised afterwards. By then every
+page was already resident as a 4 KB page, so the huge-page advice could not
+apply to it.
 
-Three memory accesses, no system calls, no locks. If `free_head` is in L1
-(likely — it's touched constantly), allocation is ~3–5 ns.
+**`mlock` can fail, and the old code ignored that.** An unprivileged process
+may lock only `RLIMIT_MEMLOCK` bytes. Measured in this repo's container, as
+uid 65534 under the default 8 MiB limit: a 256 KiB slab locked, a 16 MiB slab
+did not, and nothing reported it. Now `is_locked()` reports the outcome, and
+an unlocked slab is still prefaulted by touching every page, so first use
+does not fault. Fix it on the host with `ulimit -l`/`limits.conf` or
+`CAP_IPC_LOCK`.
+
+### Page faults on the matching path (the engine itself)
+
+`sizeof(OrderBook)` is 4.4 MiB. The constructor used to write only the
+free-list and index arrays. The order-id, quantity, price and level arrays
+were first touched *during matching*, so a fresh book took **516 minor page
+faults in its first 1M events** (each one a kernel entry) and ~0 afterwards.
+The constructor now writes every array, which moves all ~1,136 faults to
+construction. Measured: **0 faults** during the first and second 1M events.
+`bench/bench_depth.cpp` reports the fault count on every run.
 
 ### Why not per-thread pools?
 
@@ -315,44 +335,64 @@ case for real).
 
 ## 6. The order index hash map
 
-Cancel requires O(1) lookup from `OrderId` to `(slot, side)`. The standard
-choice is `std::unordered_map`, but it has several problems on the hot path:
+Cancel and modify need O(1) lookup from `OrderId` to `(slot, side)`.
+`std::unordered_map` allocates a node per insert and chases pointers on
+lookup. Its hash is not the problem: libstdc++'s `std::hash<uint64_t>` is
+the identity, and with its prime bucket counts sequential keys spread fine.
+So the index is a fixed open-addressed table: 2 × `kMaxOrders` = 131,072
+slots (load factor ≤ 0.5, never rehashed), with linear probing.
 
-- Heap allocation for bucket arrays and chained nodes
-- `std::hash<uint64_t>` is typically modulo-based — poor distribution
-- Iterator invalidation on rehash causes unpredictable latency spikes
+### Hash: Fibonacci, done right this time
 
-The implementation uses a hand-rolled open-addressed hash table with:
+```cpp
+home(id) = (id * 0x9E3779B97F4A7C15) >> (64 - 17);   // top 17 bits of id·2^64/φ
+```
 
-**Fibonacci hashing:** `id * 2654435761 >> 32`
+The top bits of the product depend on every bit of the key, so sequential,
+strided and patterned ids all spread evenly.
 
-Fibonacci hashing (multiplication by the golden ratio, scaled to the hash
-table size) distributes keys more uniformly than modulo-based hashing because
-it exploits the full bit width rather than just the low-order bits. For
-sequential `OrderId` values (which are common), modulo hashing would cluster
-all entries into the same few buckets.
+**This used to be wrong, and the document explained it backwards.** The old
+code computed `(id * 2654435761) >> 32`, a 32-bit golden-ratio constant in
+64-bit arithmetic, shifted down by 32. For any id that is about
+`0.618 × id`, a linear rescaling, so consecutive ids land in overlapping
+adjacent slots (ids 2 and 3 both map to slot 1). The old text claimed that
+*modulo* hashing clusters sequential ids, which is false: `id % 131072` puts
+consecutive ids in consecutive slots with zero collisions. Modulo's real
+weakness is ids sharing a stride with the table size.
 
-**Fixed-size table (load factor ~0.5):**
+Measured (probe simulation, 65,536 live ids, linear probing):
 
-No rehashing, ever. The table is allocated upfront at 2× the maximum order
-count. At 0.5 load factor, expected probe length is ~1.5 slots on lookup.
+| Key pattern | old `(id·2654435761)>>32` | Fibonacci (top bits) | `id % 131072` |
+|---|---|---|---|
+| sequential | mean **12,517** probes, max 25,033 | 1.00, max 1 | 1.00, max 1 |
+| stride 131,072 | 1.15, max 2 | 5.01, max 10 | **32,768**, max 65,536 |
+| stride 4 | 1.07, max 2 | 1.00, max 1 | 1.50, max 2 |
 
-**Backward-shift deletion:**
+In the engine, 60,000 resting orders with sequential ids formed **one
+60,000-slot cluster**. A cancel with 8,000 live orders took **3.5 ms**.
+After the fix the longest cluster is 2 slots and cancel is ~55 ns at every
+depth up to 60,000 (`bench/bench_depth.cpp`).
 
-On deletion, we use backward-shift to fill the hole rather than marking the
-slot as a tombstone. Tombstones accumulate over time and degrade lookup
-performance as the probe chains lengthen. Backward-shift deletion maintains
-the invariant that every key is as close as possible to its natural hash slot
-by re-hashing and repositioning any displaced entries that were only at their
-current slot because of the deleted entry's former occupancy.
+### Deletion: backward shift, actually
 
-Note: this is **not** Robin Hood hashing. Robin Hood is an *insertion* strategy
-that swaps a new key with an incumbent if the new key has probed farther from
-its natural slot than the incumbent has — minimising variance in probe lengths.
-The current implementation uses standard linear probing with backward-shift
-deletion, which is correct and sufficient given the bounded load factor (~0.5).
-Robin Hood insertion would reduce mean probe length further but adds complexity
-to the insert path.
+On delete, walk the cluster after the hole once, and move each entry back
+into the hole unless its home slot lies cyclically in `(hole, j]`. Moving
+such an entry would put it before its own home, where probing can't reach
+it. This takes O(cluster length) and leaves no tombstones.
+
+The old code was described as backward-shift but did something else. It
+removed every following entry and re-probed each one from scratch. That is
+correct, but it is O(cluster²), which turned the hash problem above from
+slow into pathological.
+
+`tests/test_order_index.cpp` asserts on structure, not timing: it rests
+60,000 sequential ids and requires the longest cluster to stay under 256
+slots. The old hash fails it with 60,000. It also forces clusters that wrap
+past the end of the table, to cover both branches of the cyclic test.
+
+This is plain linear probing, **not** Robin Hood hashing (an *insertion*
+policy that swaps with incumbents to equalize probe distances). At load
+factor ≤ 0.5 with a good hash, it isn't needed.
 
 ---
 

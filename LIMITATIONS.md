@@ -62,7 +62,11 @@ Scope is deliberate. Listed here so nobody has to discover it.
   The implementation was verified by the model-based property test
   (`test_conservation.cpp`) which caught two bugs in the first attempt.
 - **Hash index is linear-probe with backward-shift**, not Robin Hood.
-  Expected probe length 1.5 at 50% load; degrades under adversarial keys.
+  Fibonacci (top-bits) hash, load factor <= 0.5. Measured longest cluster
+  with 60,000 sequential ids: 2 slots (`bench_depth`). Keys chosen to
+  collide under this specific hash can still build long clusters; the
+  engine trusts its order-id source. The old hash collapsed on *ordinary*
+  sequential ids (docs/design.md §6).
 - **Benchmarks now cover realistic order flow and real multi-symbol
   execution, still on shared/container hardware.** `bench_replay`
   generates Modify traffic (previously absent entirely), bursty

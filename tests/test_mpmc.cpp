@@ -40,10 +40,11 @@ static void test_basic() {
 
 static void test_fifo_single_thread() {
     MPMCQueue<int, 512> q;
-    for (int i = 0; i < 256; ++i) q.try_push(i);
+    for (int i = 0; i < 256; ++i)
+        if (!q.try_push(i)) { fprintf(stderr, "FAIL: push %d into empty-enough queue\n", i); ++failed; return; }
     for (int i = 0; i < 256; ++i) {
-        int v; q.try_pop(v);
-        if (v != i) { fprintf(stderr, "FAIL: FIFO order at i=%d got=%d\n", i, v); ++failed; return; }
+        int v = -1;
+        if (!q.try_pop(v) || v != i) { fprintf(stderr, "FAIL: FIFO order at i=%d got=%d\n", i, v); ++failed; return; }
     }
     ++passed;
 }

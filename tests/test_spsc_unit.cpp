@@ -37,9 +37,10 @@ static void test_capacity_boundary() {
 
 static void test_fifo_order() {
     SPSCQueue<int, 1024> q;
-    for (int i = 0; i < 500; ++i) q.try_push(i);
+    for (int i = 0; i < 500; ++i)
+        if (!q.try_push(i)) { fprintf(stderr, "FAIL: push %d into empty-enough queue\n", i); ++failed; return; }
     for (int i = 0; i < 500; ++i) {
-        int v;
+        int v = -1;
         if (!q.try_pop(v) || v != i) {
             fprintf(stderr, "FAIL: FIFO order violated at i=%d got=%d\n", i, v);
             ++failed; return;
@@ -61,11 +62,16 @@ static void test_full_and_empty_returns() {
 static void test_interleaved() {
     SPSCQueue<int, 8> q;
     int sent = 0, received = 0;
-    for (int i = 0; i < 3; ++i) q.try_push(sent++);
-    int v;
-    for (int i = 0; i < 2; ++i) { q.try_pop(v); received++; }
-    for (int i = 0; i < 3; ++i) q.try_push(sent++);
-    while (q.try_pop(v)) received++;
+    // Every pop must return the next value in order, and every push into a
+    // not-full queue must succeed. (This used to ignore both results and
+    // count a pop as received whether or not it returned anything.)
+    bool ok = true;
+    int v = -1;
+    for (int i = 0; i < 3; ++i) ok &= q.try_push(sent++);
+    for (int i = 0; i < 2; ++i) { ok &= q.try_pop(v) && v == received; received++; }
+    for (int i = 0; i < 3; ++i) ok &= q.try_push(sent++);
+    while (q.try_pop(v)) { ok &= (v == received); received++; }
+    CHECK(ok, "Interleaved pushes succeed and pops return values in order");
     CHECK(received == sent, "All interleaved items received");
 }
 

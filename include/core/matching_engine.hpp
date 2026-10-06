@@ -20,7 +20,6 @@
 #include <array>
 #include <atomic>
 #include <thread>
-#include <unordered_map>
 #include <memory>
 
 namespace engine {

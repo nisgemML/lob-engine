@@ -60,6 +60,9 @@ target_link_libraries(trading_engine PRIVATE engine_core)
 add_executable(bench_latency bench/bench_latency.cpp)
 target_link_libraries(bench_latency PRIVATE engine_core)
 
+add_executable(bench_depth bench/bench_depth.cpp)
+target_link_libraries(bench_depth PRIVATE engine_core)
+
 add_executable(bench_throughput bench/bench_throughput.cpp)
 target_link_libraries(bench_throughput PRIVATE engine_core)
 
@@ -75,9 +78,18 @@ add_executable(test_spsc_unit tests/test_spsc_unit.cpp)
 target_link_libraries(test_spsc_unit PRIVATE engine_core)
 add_test(NAME SPSCUnit COMMAND test_spsc_unit)
 
-# Stress tests — NOT in ctest, run manually (~30s)
+# Two-thread SPSC stress (2M items + 1M wrap-arounds through a depth-4
+# queue). In ctest since it gained spin-then-yield backoff; it used to be
+# manual-only because pure spinning did not finish on oversubscribed hosts.
 add_executable(test_spsc_stress tests/test_spsc.cpp)
 target_link_libraries(test_spsc_stress PRIVATE engine_core)
+add_test(NAME SPSCStress COMMAND test_spsc_stress)
+set_tests_properties(SPSCStress PROPERTIES TIMEOUT 300)
+
+add_executable(test_order_index tests/test_order_index.cpp)
+target_link_libraries(test_order_index PRIVATE engine_core)
+add_test(NAME OrderIndex COMMAND test_order_index)
+set_tests_properties(OrderIndex PROPERTIES TIMEOUT 60)
 
 add_executable(test_matching tests/test_matching.cpp)
 target_link_libraries(test_matching PRIVATE engine_core)

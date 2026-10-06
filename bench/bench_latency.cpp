@@ -137,7 +137,7 @@ static void bench_end_to_end() {
         msg.price=to_price(99.5); msg.qty=10;
         msg.msg_type=MarketDataMsg::Type::NewOrder;
         while (!eng.submit(msg)) __builtin_ia32_pause();
-        ExecutionReport r; eng.poll_report(r);
+        ExecutionReport r; (void)eng.poll_report(r);   // warmup: drain, result irrelevant
     }
 
     static constexpr int N = 200'000;

@@ -15,7 +15,8 @@
 // Why this matters:
 // find_level() is called on every add_order and cancel — it is in the
 // matching engine hot path. At kMaxLevels=4096 and active levels 20–200,
-// AVX2 (4 int64_t per cycle, VPCMPEQQ) gives 4× throughput over scalar.
+// AVX2 compares 4 int64_t per instruction (VPCMPEQQ): a quarter of the loop
+// iterations. Measured end-to-end speedup is 1.6x at p50, not 4x.
 // At full 4096 levels: scalar ~4096 cycles worst-case vs AVX2 ~1024 cycles.
 //
 // Compile: g++ -std=c++20 -O3 -march=native -mavx2 -I include bench/bench_avx2.cpp -o bench_avx2
@@ -59,7 +60,7 @@ int main() {
     calibrate();
     printf("=== AVX2 vs Scalar find_level benchmark ===\n");
 #ifdef __AVX2__
-    printf("AVX2: enabled (VPCMPEQQ ymm — 4x int64 per cycle)\n\n");
+    printf("AVX2: enabled (VPCMPEQQ ymm — 4x int64 per instruction)\n\n");
 #else
     printf("AVX2: NOT available — scalar only\n\n");
 #endif
@@ -132,12 +133,17 @@ int main() {
 
     // Correctness check
     printf("\n=== Correctness verification ===\n");
+#ifndef __AVX2__
+    printf("SKIPPED: built without AVX2, so there is no AVX2 path to verify\n");
+#endif
     int errors = 0;
     for (auto& t : targets) {
         int32_t s = find_scalar(prices.data(), N_LEVELS, t);
 #ifdef __AVX2__
         int32_t a = engine::find_level_avx2(prices.data(), N_LEVELS, t);
         if (s != a) { printf("MISMATCH: scalar=%d avx2=%d target=%ld\n", s, a, long(t)); ++errors; }
+#else
+        (void)s;   // no AVX2 in this build: nothing to compare against
 #endif
     }
     printf("Correctness: %s (%d errors)\n", errors==0?"PASS":"FAIL", errors);

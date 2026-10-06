@@ -2,8 +2,20 @@
 
 A from-scratch C++20 limit-order-book matching engine for Linux x86-64:
 struct-of-arrays price levels, AVX2 level search, intrusive per-level order
-lists, a fixed pool with free-list, and lock-free SPSC ingress. Zero heap
-allocation, zero mutexes, zero syscalls on the matching path.
+lists, a fixed pool with free-list, and lock-free SPSC ingress. No heap
+allocation, mutexes, syscalls or page faults on the matching path (the book
+prefaults itself; `bench_depth` counts 0 faults while matching).
+
+**In 30 seconds**
+- **Correctness:** fill-by-fill equality with an independent reference model
+  on 5 × 1M random events in CI, under ASan, UBSan and TSan.
+- **Real data:** [tick-to-trade](https://github.com/nisgemML/tick-to-trade)
+  replays a real Nasdaq BX day through this engine. At 8 cut points, every
+  price level of the engine's book equals an independent reference book.
+- **Deep books (bug #16):** the order index's hash collapsed under
+  sequential order ids. One cancel took 3.5 ms with 8,000 live orders. Now
+  cancel is ~55 ns, flat to 60,000 live orders, and a structural test pins it.
+- **18 bugs found and documented below,** each with how it was caught.
 
 This is a single-symbol book plus the plumbing around it. What it deliberately
 does not do is listed in [LIMITATIONS.md](LIMITATIONS.md).
@@ -203,6 +215,42 @@ all now fixed and regression-tested:**
     `bench_replay.cpp`'s `generate_trace()` hard-fails instead of
     silently continuing; `recovery_demo.cpp` and `test_replay.cpp` both
     got explicit `is_open()` checks. See `include/core/replay.hpp`.
+16. **The order index collapsed under sequential order ids, the normal
+    case.** Its "Fibonacci hash" was `(id * 2654435761) >> 32`, which is
+    about `0.618 × id`. Consecutive ids landed in overlapping adjacent
+    slots, so 60,000 live orders formed **one 60,000-slot probe cluster**.
+    Deletion was also O(cluster²): it re-probed every following entry
+    instead of doing a single backward-shift pass. With 8,000 live orders
+    one cancel took **3.5 ms**. The docs claimed "~1.5 expected probe
+    length" and blamed *modulo* hashing for clustering sequential ids,
+    which it doesn't. Every benchmark and the conservation test kept the
+    book shallow, so nothing caught it. Found by measuring add/cancel cost
+    against depth (`bench/bench_depth.cpp`). Fixed with a top-bits
+    Fibonacci hash and true backward-shift deletion: cancel is ~55 ns flat
+    to 60,000 orders. `tests/test_order_index.cpp` asserts the longest
+    cluster stays small, a structural check rather than a timing one. A
+    timing check was tried first, and the old hash alone passed it.
+    See docs/design.md §6.
+17. **"Zero syscalls on the matching path" was false for a cold book.**
+    The 4.4 MiB `OrderBook` wrote only some of its arrays at construction.
+    The rest faulted in during matching: **516 minor page faults in the
+    first 1M events**, then ~0. The constructor now writes every array, and
+    the count is 0. Separately, `util::PoolAllocator` ignored `mlock`
+    failure (shown as an unprivileged user: a 16 MiB slab silently failed to
+    lock under the default 8 MiB limit) and applied `MADV_HUGEPAGE` after
+    `MAP_POPULATE` had already faulted every page in at 4 KB. Both are
+    fixed, and `is_locked()` now reports the outcome. The docs also
+    described this allocator as the engine's memory strategy. The engine
+    never used it.
+18. **Tests that could not fail, and a stress test CI never ran.** Three
+    queue tests ignored `try_push`/`try_pop` results and read possibly
+    uninitialized values. One counted a pop as received whether or not it
+    returned anything. The SPSC wrap-around test recorded `prev` and never
+    checked it, so reordering or duplication across wraps would pass. The
+    stress test spun with `PAUSE` only and never finished on one vCPU
+    (killed at 150 s), which is why it was manual-only. It now verifies
+    exact order, backs off to `yield`, runs in ~2 s, and is in ctest.
+    Found via 13 compiler warnings, now 0.
 
 ---
 
@@ -239,17 +287,23 @@ directly comparable. See `PROFILING.md` §1 for that distinction spelled out.
 | Scalar | 67 ns | 90 ns | 115 ns | 1× |
 | AVX2 (`VPCMPEQQ`) | **42 ns** | 53 ns | 64 ns | **1.6×** |
 
-AVX2 processes 4× int64 per cycle vs scalar 1×. See `bench/bench_avx2.cpp`.
+AVX2 compares 4× int64 per instruction vs scalar 1×, so it needs a quarter of the iterations. The measured gain is 1.6×, not 4×. Re-run for this audit: 70 vs 43 ns at p50, twice. See `bench/bench_avx2.cpp`.
 
-### Hot path cost breakdown
+### Add / cancel cost vs book depth — `bench_depth`, sequential order ids
 
-| Component | Cost |
-|-----------|------|
-| `find_level()` AVX2 | 42 ns |
-| Intrusive list walk (cancel) | 22 ns |
-| Pool allocator | 3–5 ns |
-| SPSC enqueue | 12 ns |
-| Hash lookup (Fibonacci) | 5 ns |
+| Live orders | add | cancel | longest index cluster | page faults while matching |
+|---|---|---|---|---|
+| 1,000 | 110–124 ns | 54–64 ns | 1 | 2 |
+| 8,000 | 79–93 ns | 53–65 ns | 1 | 0 |
+| 60,000 | 83–86 ns | 60 ns | 2 | 0 |
+
+Before bug #16's fix, cancel cost was 62 µs at 1,000 live orders and
+3.5 ms at 8,000, and 16,000 did not finish. See BENCHMARK_RESULTS.md.
+
+(An earlier "hot path cost breakdown" table listed per-component figures,
+including a pool allocator the engine doesn't use and an SPSC figure that
+conflicted with the measured 32 ns above, with no benchmark behind them.
+It has been removed.)
 
 ---
 
@@ -277,8 +331,9 @@ Feed (UDP/sim)
 └─────────────────────┘
 ```
 
-The hot path contains **zero mutexes, zero heap allocations, and zero system
-calls** after startup.
+The matching path takes **no mutexes, makes no heap allocations, and makes no
+system calls** after startup. That now includes page faults: the 4.4 MiB book
+is fully written at construction (bug #17).
 
 ---
 
@@ -288,7 +343,7 @@ calls** after startup.
 
 `find_level()` scans the `prices[]` array for a matching price. The scalar
 version processes one `int64_t` per iteration; the AVX2 version uses
-`VPCMPEQQ` to compare 4× `int64_t` per cycle:
+`VPCMPEQQ` to compare 4× `int64_t` per instruction:
 
 ```cpp
 // AVX2: 4 × int64 compared per instruction
@@ -302,7 +357,8 @@ for (uint32_t i = 0; i < n; i += 4) {
 ```
 
 Measured speedup: **1.6× at p50** (42 ns vs 67 ns, N=128 levels).
-Branch mispredictions also drop 4× — AVX2 has 32 iterations vs 128 scalar.
+The loop runs 32 iterations instead of 128. Branch-miss counts were not
+measured, so no misprediction claim is made.
 
 ### Cache-aware order book — struct-of-arrays
 

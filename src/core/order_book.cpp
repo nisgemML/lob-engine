@@ -90,6 +90,13 @@ void OrderBook::Side::remove_level(uint32_t idx) noexcept {
 // ── OrderBook::SlotPool ───────────────────────────────────────────────────────
 
 void OrderBook::SlotPool::init() noexcept {
+    // Write every array once so each page is faulted in here, at
+    // construction, not on the matching path the first time a slot is used.
+    // Before this, only free_nexts was written: a fresh book took ~500 minor
+    // page faults during its first 1M events (each a kernel entry) and ~0
+    // after. The values are irrelevant — slot state is defined by the lists.
+    ids.fill(0); qtys.fill(0); nexts.fill(NULL_IDX); prevs.fill(NULL_IDX);
+    prices.fill(0); accounts.fill(0);
     for (uint32_t i = 0; i < kMaxOrders - 1; ++i)
         free_nexts[i] = i + 1;
     free_nexts[kMaxOrders - 1] = NULL_IDX;
@@ -117,10 +124,38 @@ void OrderBook::OrderIndex::init() noexcept {
     for (auto& e : table) { e.slot = kEmpty; e.key = 0; e.side = 0xFF; }
 }
 
+// Fibonacci hashing: multiply by 2^64/phi and keep the TOP kBits bits.
+// The top bits of the product depend on every bit of the key, so sequential
+// order IDs — how exchanges and this repo's own tests assign them — spread
+// evenly across the table.
+//
+// An earlier version computed (id * 2654435761) >> 32, which for any id is
+// about 0.618 * id: consecutive IDs landed in overlapping adjacent slots.
+// With 65,536 sequential IDs live, linear probing then averaged ~12,500
+// probes per lookup (max ~25,000) instead of ~1, and a cancel in an
+// 8,000-order book took ~3.5 ms. See BENCHMARK_RESULTS.md, "Order index".
+uint32_t OrderBook::OrderIndex::home(OrderId id) noexcept {
+    return static_cast<uint32_t>((id * 0x9E3779B97F4A7C15ULL) >> (64 - kBits));
+}
+
+uint32_t OrderBook::OrderIndex::longest_cluster() const noexcept {
+    // Start just after an empty slot so a run that wraps the end is counted
+    // once, whole. (Load factor <= 0.5 guarantees an empty slot exists.)
+    uint32_t start = 0;
+    while (table[start].slot != kEmpty) ++start;
+    uint32_t best = 0, run = 0;
+    for (uint32_t n = 1; n <= kTableSize; ++n) {
+        const uint32_t i = (start + n) & kMask;
+        if (table[i].slot != kEmpty) { if (++run > best) best = run; }
+        else run = 0;
+    }
+    return best;
+}
+
 uint32_t OrderBook::OrderIndex::probe(OrderId id) const noexcept {
-    uint32_t h = static_cast<uint32_t>(id * 2654435761ULL >> 32) % kTableSize;
+    uint32_t h = home(id);
     while (table[h].slot != kEmpty && table[h].key != id)
-        h = (h + 1) % kTableSize;
+        h = (h + 1) & kMask;
     return h;
 }
 
@@ -139,19 +174,29 @@ bool OrderBook::OrderIndex::lookup(OrderId id, uint32_t& slot_out, uint8_t& side
     return true;
 }
 
+// Backward-shift deletion (linear probing): walk the cluster after the hole
+// once; move an entry back into the hole unless its home slot lies
+// cyclically in (hole, j], in which case moving it would place it before
+// its own home and make it unreachable. O(cluster length), no tombstones.
+//
+// An earlier version removed every following entry and re-probed each one
+// from scratch — correct, but O(cluster^2), which compounded the hash
+// problem above.
 bool OrderBook::OrderIndex::remove(OrderId id) noexcept {
-    uint32_t h = probe(id);
-    if (table[h].slot == kEmpty) return false;
-    table[h].slot = kEmpty;
-    table[h].key  = 0;
-    uint32_t j = (h + 1) % kTableSize;
-    while (table[j].slot != kEmpty) {
-        auto entry = table[j];
-        table[j].slot = kEmpty;
-        uint32_t k = probe(entry.key);
-        table[k] = entry;
-        j = (j + 1) % kTableSize;
+    uint32_t hole = probe(id);
+    if (table[hole].slot == kEmpty) return false;
+    uint32_t j = hole;
+    for (;;) {
+        j = (j + 1) & kMask;
+        if (table[j].slot == kEmpty) break;
+        const uint32_t h = home(table[j].key);
+        const bool stays = (hole <= j) ? (hole < h && h <= j)
+                                       : (hole < h || h <= j);
+        if (stays) continue;
+        table[hole] = table[j];
+        hole = j;
     }
+    table[hole] = Entry{};
     return true;
 }
 
@@ -162,11 +207,11 @@ OrderBook::OrderBook(SymbolId symbol, MatchCallback on_match)
 {
     slots_.init();
     index_.init();
-}
-
-// Find the level index by price — needed after remove_level may have shifted indices.
-static int32_t find_level_for_slot(OrderBook::Side& side, Price price, bool is_bid) {
-    return side.find_level(price, is_bid);
+    // Price-level arrays: same reason — touch every page up front.
+    for (Side* sd : {&bids_, &asks_}) {
+        sd->prices.fill(0); sd->qtys.fill(0); sd->order_counts.fill(0);
+        sd->head_idxs.fill(NULL_IDX); sd->tail_idxs.fill(NULL_IDX);
+    }
 }
 
 bool OrderBook::add_order(const Order& order) noexcept {

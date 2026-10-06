@@ -42,6 +42,11 @@ public:
     [[nodiscard]] uint64_t  total_cancelled() const noexcept { return stat_cancelled_; }
     [[nodiscard]] uint64_t  total_self_trade_prevented() const noexcept { return stat_self_trade_prevented_; }
 
+    // Diagnostic (O(table size), not for the hot path): length of the longest
+    // run of occupied slots in the order-id index. Linear-probing cost is
+    // bounded by it, so tests assert on it directly instead of on timing.
+    [[nodiscard]] uint32_t index_longest_cluster() const noexcept { return index_.longest_cluster(); }
+
     // ── Internal types exposed for the .cpp implementation ──────────────────
 
     struct Side {
@@ -92,7 +97,10 @@ public:
     };
 
     struct OrderIndex {
-        static constexpr uint32_t kTableSize = kMaxOrders * 2;
+        static constexpr uint32_t kTableSize = kMaxOrders * 2;   // load factor <= 0.5
+        static constexpr uint32_t kBits      = 17;
+        static constexpr uint32_t kMask      = kTableSize - 1;
+        static_assert(kTableSize == (1u << kBits), "Fibonacci hash keeps kBits top bits; table must be 2^kBits");
         static constexpr uint32_t kEmpty     = UINT32_MAX;
 
         struct Entry {
@@ -107,8 +115,10 @@ public:
         bool insert(OrderId id, uint32_t slot, uint8_t side) noexcept;
         bool lookup(OrderId id, uint32_t& slot_out, uint8_t& side_out) const noexcept;
         bool remove(OrderId id) noexcept;
+        [[nodiscard]] uint32_t longest_cluster() const noexcept;   // diagnostic
 
     private:
+        [[nodiscard]] static uint32_t home(OrderId id) noexcept;
         [[nodiscard]] uint32_t probe(OrderId id) const noexcept;
     };
 

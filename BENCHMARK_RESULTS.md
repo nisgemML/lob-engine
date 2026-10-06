@@ -46,7 +46,7 @@ For production latency numbers, run pinned:
 ## Test results
 
 ```
-18 ctest entries, 0 failed:
+20 ctest entries, 0 failed:
 
   OrderBook              — 43 passed  (includes modify increase/decrease
                                         priority, IOC/FOK, self-trade
@@ -54,8 +54,16 @@ For production latency numbers, run pinned:
                                         heap-allocates its OrderBook —
                                         see docs/design.md §9 for the
                                         ASan stack-overflow this fixed)
-  SPSCUnit               — 12 passed  (fast unit tests; stress test:
-                                        ./test_spsc_stress ~30s)
+  SPSCUnit               — 13 passed  (interleaved test now checks
+                                        every push/pop result and order)
+  SPSCStress             — 13 passed  (new in ctest — 2M items + 1M
+                                        wrap-arounds through a depth-4
+                                        queue, exact order verified; ~2s
+                                        on one vCPU, previously did not
+                                        finish there and was manual-only)
+  OrderIndex             — 20,019 passed (new — 60,000 sequential ids,
+                                        structural longest-cluster check,
+                                        wrapping clusters; README bug #16)
   Matching               — 8  passed
   Allocator              — 84 passed
   MPMC                   — 24 passed
@@ -189,35 +197,73 @@ a genuine capacity-planning number, not a defect: it says something real
 about how large `kQueueDepth` needs to be for a given burst intensity,
 which a benchmark with no bursts literally cannot tell you.
 
-**Key design decisions driving these numbers:**
+**Design notes, and what is and isn't measured here:**
 
-**SoA order book:** `prices[]` hot array stays in L1 cache during the matching
-sweep. Pointer-based alternatives cause 3 cache misses per match; SoA causes
-near-zero. Measured difference: ~25ns per match at L3 miss rate.
+**SoA order book:** `prices[]` is a dense array, so the matching sweep
+touches fewer cache lines than a pointer-based layout. That is structurally
+true. The speedup is **not** demonstrated in this environment: after the
+`bench_cache` calibration fix (README bug #14), 10 runs at the deepest level
+averaged ~1.02x, within noise. An earlier version of this paragraph claimed
+a "measured ~25ns per match" difference, which contradicted that result and
+has been removed. See `PROFILING.md` §3.
 
-**Fibonacci hashing:** `id × 2654435761 >> 32` distributes sequential order IDs
-uniformly. Modulo hashing fills the first N buckets before others — O(N) average
-probe length under sequential IDs. Fibonacci gives 1.5 expected probe length.
-
-**Pool allocator:** mmap'd slab, mlock'd at startup (zero page faults at runtime),
-MADV_HUGEPAGE, freelist threaded through slab. ~3–5ns per allocation.
-SPSC queues use release/acquire only — no `seq_cst` MFENCE on the hot path.
-
-**Backward-shift deletion:** re-positions displaced entries after deletion,
-maintaining 1.5 expected probe length indefinitely. Tombstones accumulate
-and degrade to O(table-size); Robin Hood is an insertion strategy, not deletion.
+**SPSC queues** use release/acquire only. On x86, a `seq_cst` store compiles
+to `XCHG` (not `MFENCE`). Either way, it is unnecessary for SPSC.
 
 ---
 
-## Per-operation latency (unit test instrumentation)
+## Order index under deep books (`bench_depth`)
+
+Every other benchmark here keeps the book shallow (a few hundred live
+orders). `bench/bench_depth.cpp` rests N non-crossing orders with
+**sequential** ids, how exchanges assign them, then cancels them all. It
+reports the median of 5 runs, the index's longest probe cluster, and minor
+page faults taken while matching.
+
+**Before the fix** (old hash `(id·2654435761)>>32` ≈ 0.618·id, O(cluster²)
+delete), one run, stopped by a 240 s timeout:
 
 ```
-add_order  : p50 =  112 ns   p99 = 5,319 ns
-cancel     : p50 =   22 ns   p99 =   180 ns
+live    add ns/op   cancel ns/op
+ 1000       292.0        62,037
+ 4000       920.7       891,122
+ 8000     1,367.7     3,510,133      (3.5 ms per cancel)
+16000   (did not finish)
 ```
 
-p99 spike on add_order is from the hash table probe under adversarial
-key patterns (load factor approaching 0.5). Mean probe length: 1.48.
+**After** (Fibonacci top-bits hash, single-pass backward-shift delete,
+book prefaulted at construction), two separate invocations:
+
+```
+    live    add ns/op cancel ns/op    cluster   faults
+    1000        124.0         64.2          1        2
+    4000         85.5         50.2          1        0
+    8000         92.7         64.5          1        0
+   16000         83.9         57.6          1        0
+   32000         83.7         61.4          1        0
+   60000         85.6         60.2          2        0
+
+    1000        109.6         54.4          1        2
+    4000         76.0         52.4          1        0
+    8000         79.1         52.5          1        0
+   16000         78.2         55.3          1        0
+   32000         81.6         56.2          1        0
+   60000         82.8         59.7          2        0
+```
+
+Flat in depth to 60,000 live orders (`kMaxOrders` = 65,536). With the old
+hash, the same 60,000 sequential ids formed one 60,000-slot cluster.
+Container (one vCPU, no isolation), so treat the absolute ns as tier-2. The
+shape is the result.
+
+Why nothing caught it earlier: the conservation test and all benchmarks run
+shallow books, and tick-to-trade's real Nasdaq BX day has 15-60 resting
+orders per symbol. A main-venue day would have hit it.
+
+**Removed:** a previous "Per-operation latency (unit test instrumentation)"
+section (`add_order p50 = 112 ns`, `mean probe length: 1.48`). No code in
+the repo produces those numbers, and the probe-length claim was the
+opposite of what the old hash did.
 
 ---
 
@@ -286,7 +332,7 @@ number implied. This makes sense once the naive baseline is actually
 doing real work: it pays `std::map`'s O(log n) insert/erase on every
 operation with no pooling, no intrusive lists, and dynamic node
 allocation per order, which is exactly the cost this codebase's SoA
-layout, Fibonacci hashing, and pool allocator exist to avoid. The naive
+layout, fixed slot pool and open-addressed order index exist to avoid. The naive
 implementation is still valuable as a *correctness* reference (simple
 enough to trust by inspection) and as the baseline
 `test_conservation.cpp`'s independent model is built in the same spirit

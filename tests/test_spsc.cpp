@@ -29,6 +29,20 @@ static int failed = 0;
 
 // ── Single-threaded correctness ───────────────────────────────────────────────
 
+
+// Spin briefly, then yield. A pure PAUSE spin assumes the other thread is
+// running on another core; on an oversubscribed host (CI runner, container,
+// fewer cores than threads) each handoff would wait out a whole scheduler
+// time slice, and this test previously did not finish in 150 s on one vCPU.
+struct Backoff {
+    int n = 0;
+    void operator()() noexcept {
+        if (n < 128) { __builtin_ia32_pause(); ++n; }
+        else std::this_thread::yield();
+    }
+    void reset() noexcept { n = 0; }
+};
+
 static void test_basic_push_pop() {
     SPSCQueue<int, 16> q;
     CHECK(q.empty(), "Initially empty");
@@ -59,12 +73,12 @@ static void test_capacity_boundary() {
 
 static void test_fifo_order() {
     SPSCQueue<int, 1024> q;
-    for (int i = 0; i < 500; ++i) q.try_push(i);
+    for (int i = 0; i < 500; ++i)
+        if (!q.try_push(i)) { fprintf(stderr, "FAIL: push %d into empty-enough queue\n", i); ++failed; return; }
 
     for (int i = 0; i < 500; ++i) {
-        int v;
-        q.try_pop(v);
-        if (v != i) {
+        int v = -1;
+        if (!q.try_pop(v) || v != i) {
             fprintf(stderr, "FAIL: FIFO order violated at i=%d got=%d\n", i, v);
             ++failed;
             return;
@@ -84,18 +98,19 @@ static void test_concurrent_correctness() {
     received.reserve(kItems);
 
     std::thread producer([&] {
-        while (!start.load(std::memory_order_acquire)) {}
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         for (uint64_t i = 0; i < kItems; ++i) {
-            while (!q.try_push(i)) __builtin_ia32_pause();
+            { Backoff b; while (!q.try_push(i)) b(); }
         }
     });
 
     std::thread consumer([&] {
-        while (!start.load(std::memory_order_acquire)) {}
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         uint64_t v;
+        Backoff b;
         while (static_cast<int>(received.size()) < kItems) {
-            if (q.try_pop(v)) received.push_back(v);
-            else __builtin_ia32_pause();
+            if (q.try_pop(v)) { received.push_back(v); b.reset(); }
+            else b();
         }
     });
 
@@ -121,26 +136,31 @@ static void test_wrap_around() {
 
     std::atomic<bool> go{false};
     uint64_t total_rx = 0;
+    uint64_t order_errors = 0;
 
     std::thread prod([&] {
-        while (!go.load()) {}
+        while (!go.load()) std::this_thread::yield();
         for (uint32_t i = 0; i < kRounds; ++i) {
-            while (!q.try_push(i)) __builtin_ia32_pause();
+            { Backoff b; while (!q.try_push(i)) b(); }
         }
     });
 
     std::thread cons([&] {
-        while (!go.load()) {}
-        uint32_t v, prev = UINT32_MAX;
+        while (!go.load()) std::this_thread::yield();
+        // Each value must be exactly the next one sent: a wrap-around bug
+        // (lost, duplicated, or stale slot) shows up as a sequence break.
+        // (This loop used to record `prev` and never check it.)
+        uint32_t v = 0;
         int count = 0;
+        Backoff b;
         while (count < kRounds) {
             if (q.try_pop(v)) {
+                if (v != static_cast<uint32_t>(count)) ++order_errors;
                 ++total_rx;
                 ++count;
-                prev = v;
-            }
+                b.reset();
+            } else b();
         }
-        (void)prev;
     });
 
     go.store(true, std::memory_order_release);
@@ -148,6 +168,7 @@ static void test_wrap_around() {
     cons.join();
 
     CHECK(total_rx == kRounds, "Wrap-around: all items received");
+    CHECK(order_errors == 0, "Wrap-around: every item in exact send order");
 }
 
 int main() {
